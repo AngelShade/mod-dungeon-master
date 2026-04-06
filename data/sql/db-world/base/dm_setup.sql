@@ -34,10 +34,11 @@ DELETE FROM `creature_template`      WHERE `entry` = 500000;
 -- unit_class = 1        (Warrior - simplest stats)
 -- ScriptName must match the CreatureScript registered in C++
 INSERT INTO `creature_template` (
-    `entry`, `name`, `subname`,
+    `entry`,
+    `name`, `subname`,
     `minlevel`, `maxlevel`,
     `faction`, `npcflag`,
-    `speed_walk`, `speed_run`, `scale`,
+    `speed_walk`, `speed_run`,
     `unit_class`, `unit_flags`, `unit_flags2`,
     `type`, `flags_extra`,
     `ScriptName`
@@ -46,17 +47,18 @@ INSERT INTO `creature_template` (
     'The Dungeon Master',
     'Challenge Awaits',
     80, 80,
-    190,  -- neutral (yellow nameplate)
-    1,    -- gossip flag
+    190,   -- neutral (yellow nameplate)
+    1,     -- gossip flag
     1.0, 1.14286,
-    1.2,  -- slightly larger than normal
-    1,    -- warrior
-    2,    -- NON_ATTACKABLE
+    1,     -- warrior
+    2,     -- NON_ATTACKABLE
     0,
-    7,    -- humanoid
-    2,    -- CIVILIAN
+    7,     -- humanoid
+    2,     -- CIVILIAN
     'npc_dungeon_master'
 );
+
+
 
 -- -----------------------------------------------
 -- Step 3: Display Model  (Stormwind Guard)
@@ -66,7 +68,7 @@ INSERT INTO `creature_template` (
 INSERT INTO `creature_template_model` (
     `CreatureID`, `Idx`, `CreatureDisplayID`, `DisplayScale`, `Probability`
 ) VALUES (
-    500000, 0, 3167, 1.0, 1.0
+    500000, 0, 3167, 1.2, 1.0
 );
 
 -- -----------------------------------------------
@@ -168,10 +170,11 @@ DELETE FROM `creature_template`      WHERE `entry` = 500001;
 -- unit_flags = 2        (NON_ATTACKABLE)
 -- flags_extra = 2       (CIVILIAN)
 INSERT INTO `creature_template` (
-    `entry`, `name`, `subname`,
+    `entry`,
+    `name`, `subname`,
     `minlevel`, `maxlevel`,
     `faction`, `npcflag`,
-    `speed_walk`, `speed_run`, `scale`,
+    `speed_walk`, `speed_run`,
     `unit_class`, `unit_flags`, `unit_flags2`,
     `type`, `flags_extra`,
     `ScriptName`
@@ -183,7 +186,6 @@ INSERT INTO `creature_template` (
     35,     -- friendly to all (green nameplate)
     6785,   -- GOSSIP(1) + VENDOR(128) + VENDOR_FOOD(512) + VENDOR_REAGENT(2048) + REPAIR(4096)
     1.0, 1.14286,
-    1.0,
     1,      -- warrior (simplest stats)
     2,      -- NON_ATTACKABLE
     0,
@@ -191,6 +193,8 @@ INSERT INTO `creature_template` (
     2,      -- CIVILIAN
     ''      -- no custom script; built-in vendor/repair handling
 );
+
+
  
 -- -----------------------------------------------
 -- Vendor Display Model
