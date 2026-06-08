@@ -52,8 +52,9 @@ static float RandFloat(float lo, float hi) { return std::uniform_real_distributi
 class DungeonMasterCreatureAI : public CreatureAI
 {
 public:
-    explicit DungeonMasterCreatureAI(Creature* creature)
-        : CreatureAI(creature), _patrolStarted(false), _aggroScanTimer(0) {}
+    explicit DungeonMasterCreatureAI(Creature* creature, bool isBoss = false)
+        : CreatureAI(creature), _patrolStarted(false), _aggroScanTimer(0),
+          _isBoss(isBoss), _stuckCheckTimer(0) {}
 
     // Active aggro detection — overrides the default which has many silent skips
     void MoveInLineOfSight(Unit* who) override
@@ -82,6 +83,53 @@ public:
 
     void UpdateAI(uint32 diff) override
     {
+        // --- Stuck boss recovery (only for bosses, every 2 seconds) ---
+        if (_isBoss && me->IsAlive())
+        {
+            _stuckCheckTimer += diff;
+            if (_stuckCheckTimer >= 2000)
+            {
+                _stuckCheckTimer = 0;
+                float spawnZ = me->GetHomePosition().GetPositionZ();
+                float curZ   = me->GetPositionZ();
+
+                // Boss has fallen more than 15 yards below its spawn point
+                if (curZ < (spawnZ - 15.0f))
+                {
+                    float homeX = me->GetHomePosition().GetPositionX();
+                    float homeY = me->GetHomePosition().GetPositionY();
+                    float homeZ = me->GetHomePosition().GetPositionZ();
+                    float homeO = me->GetHomePosition().GetOrientation();
+
+                    // Stop combat and reset AI state
+                    me->CombatStop(true);
+                    me->GetThreatMgr().ClearAllThreat();
+                    me->GetMotionMaster()->Clear(false);
+                    me->GetMotionMaster()->MoveIdle();
+
+                    // Teleport back to spawn
+                    me->NearTeleportTo(homeX, homeY, homeZ, homeO);
+
+                    // Heal to full
+                    me->SetHealth(me->GetMaxHealth());
+
+                    // Notify all players in the instance
+                    Map::PlayerList const& players = me->GetMap()->GetPlayers();
+                    for (auto const& itr : players)
+                    {
+                        if (Player* p = itr.GetSource())
+                            ChatHandler(p->GetSession()).SendSysMessage(
+                                "|cFFFF0000[Dungeon Master]|r Boss fell out of bounds! "
+                                "Teleported back to spawn point and fully healed.");
+                    }
+
+                    LOG_WARN("module", "DungeonMaster: Boss '{}' (Entry {}) fell below spawn Z "
+                        "({:.1f} vs {:.1f}), teleported back.",
+                        me->GetName(), me->GetEntry(), curZ, spawnZ);
+                }
+            }
+        }
+
         if (!UpdateVictim())
         {
             // Start random patrol movement when idle
@@ -152,6 +200,8 @@ public:
 private:
     bool   _patrolStarted;
     uint32 _aggroScanTimer;
+    bool   _isBoss;
+    uint32 _stuckCheckTimer;
 };
 
 // ---------------------------------------------------------------------------
@@ -278,6 +328,16 @@ void DungeonMasterMgr::LoadCreaturePools()
             }
             else                                              // normal (rank 0) → trash pool
             {
+                // Strip CREATURE_TYPE_FLAG_BOSS_MOB (0x4) from rank-0 trash so they
+                // don't display as skull-level or use world-boss combat math.
+                const CreatureTemplate* cInfo = sObjectMgr->GetCreatureTemplate(e.Entry);
+                if (cInfo && cInfo->rank == 0 && (cInfo->type_flags & 0x4))
+                {
+                    const_cast<CreatureTemplate*>(cInfo)->type_flags &= ~0x4;
+                    LOG_INFO("module", "DungeonMaster: Patched in-memory template for trash creature '{}' (entry {}) to strip CREATURE_TYPE_FLAG_BOSS_MOB flag.",
+                        cInfo->Name, e.Entry);
+                }
+
                 _creaturesByType[e.Type].push_back(e);
                 ++trashCount;
             }
@@ -1216,7 +1276,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         // All spawned creatures (trash and bosses alike) use DungeonMasterCreatureAI,
         // which handles aggro scanning, patrol movement, and death hooks.
         // Bosses rely on auto-attack only — no scripted spell rotations.
-        c->SetAI(new DungeonMasterCreatureAI(c));
+        c->SetAI(new DungeonMasterCreatureAI(c, isBoss));
 
         // Force visibility refresh or client won't see the creature
         c->UpdateObjectVisibility(true);
@@ -1231,7 +1291,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
     {
         if (sp.IsBossPosition) continue;
 
-        uint32 entry = SelectCreatureForTheme(theme, false);
+        uint32 entry = SelectCreatureForTheme(theme, false, targetLevel);
         if (!entry) continue;
 
         Creature* c = map->SummonCreature(entry, sp.Pos);
@@ -1297,7 +1357,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
             size_t pickIdx  = validRarePoints[RandInt<size_t>(startIdx, endIdx)];
             SpawnPoint& rareSP = session->SpawnPoints[pickIdx];
 
-            uint32 rareEntry = SelectCreatureForTheme(theme, true);
+            uint32 rareEntry = SelectCreatureForTheme(theme, true, targetLevel);
             if (rareEntry)
             {
                 Creature* r = map->SummonCreature(rareEntry, rareSP.Pos);
@@ -1359,7 +1419,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         if (!sp.IsBossPosition || bossesSpawned >= sDMConfig->GetBossCount())
             continue;
 
-        uint32 entry = SelectDungeonBoss(theme);
+        uint32 entry = SelectDungeonBoss(theme, targetLevel);
         if (!entry) { LOG_WARN("module", "DungeonMaster: No boss candidate."); continue; }
 
         Creature* b = map->SummonCreature(entry, sp.Pos);
@@ -1467,10 +1527,9 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
 }
 
 // Select a creature matching the theme
-uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
+uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 targetLevel)
 {
     if (!theme) return 0;
-
 
     std::set<uint32> types;
     bool anyType = false;
@@ -1485,6 +1544,14 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
         return anyType || types.count(cType);
     };
 
+    auto levelMatch = [&](const CreaturePoolEntry& e) -> bool
+    {
+        if (targetLevel == 0)
+            return true;
+        // Allow a level band: e.g. MinLevel is at most targetLevel + 5, and MaxLevel is at least targetLevel - 10
+        return (e.MinLevel <= targetLevel + 5) && (e.MaxLevel >= targetLevel - 10);
+    };
+
     std::vector<uint32> candidates;
 
     if (isBoss)
@@ -1494,7 +1561,21 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
         {
             if (!typeMatch(type)) continue;
             for (const auto& e : vec)
-                candidates.push_back(e.Entry);
+            {
+                if (levelMatch(e))
+                    candidates.push_back(e.Entry);
+            }
+        }
+
+        // Try themed elites without level filter if no candidates matched the level range
+        if (candidates.empty() && targetLevel != 0)
+        {
+            for (const auto& [type, vec] : _bossCreatures)
+            {
+                if (!typeMatch(type)) continue;
+                for (const auto& e : vec)
+                    candidates.push_back(e.Entry);
+            }
         }
 
         // --- Fallback: promote themed trash to boss (stats will be scaled up) ---
@@ -1504,7 +1585,19 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
             {
                 if (!typeMatch(type)) continue;
                 for (const auto& e : vec)
-                    candidates.push_back(e.Entry);
+                {
+                    if (levelMatch(e))
+                        candidates.push_back(e.Entry);
+                }
+            }
+            if (candidates.empty() && targetLevel != 0)
+            {
+                for (const auto& [type, vec] : _creaturesByType)
+                {
+                    if (!typeMatch(type)) continue;
+                    for (const auto& e : vec)
+                        candidates.push_back(e.Entry);
+                }
             }
         }
     }
@@ -1515,7 +1608,19 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
         {
             if (!typeMatch(type)) continue;
             for (const auto& e : vec)
-                candidates.push_back(e.Entry);
+            {
+                if (levelMatch(e))
+                    candidates.push_back(e.Entry);
+            }
+        }
+        if (candidates.empty() && targetLevel != 0)
+        {
+            for (const auto& [type, vec] : _creaturesByType)
+            {
+                if (!typeMatch(type)) continue;
+                for (const auto& e : vec)
+                    candidates.push_back(e.Entry);
+            }
         }
     }
 
@@ -1528,15 +1633,37 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
         if (isBoss)
         {
             for (const auto& [type, vec] : _bossCreatures)
+            {
                 for (const auto& e : vec)
-                    candidates.push_back(e.Entry);
+                {
+                    if (levelMatch(e))
+                        candidates.push_back(e.Entry);
+                }
+            }
+            if (candidates.empty() && targetLevel != 0)
+            {
+                for (const auto& [type, vec] : _bossCreatures)
+                    for (const auto& e : vec)
+                        candidates.push_back(e.Entry);
+            }
         }
 
         if (candidates.empty())
         {
             for (const auto& [type, vec] : _creaturesByType)
+            {
                 for (const auto& e : vec)
-                    candidates.push_back(e.Entry);
+                {
+                    if (levelMatch(e))
+                        candidates.push_back(e.Entry);
+                }
+            }
+            if (candidates.empty() && targetLevel != 0)
+            {
+                for (const auto& [type, vec] : _creaturesByType)
+                    for (const auto& e : vec)
+                        candidates.push_back(e.Entry);
+            }
         }
     }
 
@@ -1553,10 +1680,9 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss)
 }
 
 
-uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme)
+uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 targetLevel)
 {
     if (!theme) return 0;
-
 
     std::set<uint32> types;
     bool anyType = false;
@@ -1571,13 +1697,32 @@ uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme)
         return anyType || types.count(cType);
     };
 
+    auto levelMatch = [&](const CreaturePoolEntry& e) -> bool
+    {
+        if (targetLevel == 0)
+            return true;
+        return (e.MinLevel <= targetLevel + 5) && (e.MaxLevel >= targetLevel - 10);
+    };
+
     // Prefer themed dungeon bosses
     std::vector<uint32> candidates;
     for (const auto& [type, vec] : _dungeonBossPool)
     {
         if (!typeMatch(type)) continue;
         for (const auto& e : vec)
-            candidates.push_back(e.Entry);
+        {
+            if (levelMatch(e))
+                candidates.push_back(e.Entry);
+        }
+    }
+    if (candidates.empty() && targetLevel != 0)
+    {
+        for (const auto& [type, vec] : _dungeonBossPool)
+        {
+            if (!typeMatch(type)) continue;
+            for (const auto& e : vec)
+                candidates.push_back(e.Entry);
+        }
     }
 
     // Fallback: any dungeon boss
@@ -1586,15 +1731,26 @@ uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme)
         LOG_DEBUG("module", "DungeonMaster: No themed dungeon boss for '{}' — using any dungeon boss.",
             theme->Name);
         for (const auto& [type, vec] : _dungeonBossPool)
+        {
             for (const auto& e : vec)
-                candidates.push_back(e.Entry);
+            {
+                if (levelMatch(e))
+                    candidates.push_back(e.Entry);
+            }
+        }
+        if (candidates.empty() && targetLevel != 0)
+        {
+            for (const auto& [type, vec] : _dungeonBossPool)
+                for (const auto& e : vec)
+                    candidates.push_back(e.Entry);
+        }
     }
 
     // Last resort: generic boss pool
     if (candidates.empty())
     {
         LOG_WARN("module", "DungeonMaster: Dungeon boss pool empty — falling back to generic boss selection.");
-        return SelectCreatureForTheme(theme, true);
+        return SelectCreatureForTheme(theme, true, targetLevel);
     }
 
     uint32 entry = candidates[RandInt<size_t>(0, candidates.size() - 1)];
@@ -2638,6 +2794,145 @@ uint32 DungeonMasterMgr::GetRemainingCooldown(ObjectGuid g) const
     time_t now = GameTime::GetGameTime().count();
     return (now < static_cast<time_t>(it->second))
         ? static_cast<uint32>(it->second - now) : 0;
+}
+
+bool DungeonMasterMgr::ResetActiveBoss(ObjectGuid playerGuid, std::string& errorReason)
+{
+    Session* session = GetSessionByPlayer(playerGuid);
+    if (!session)
+    {
+        errorReason = "You are not in a Dungeon Master challenge.";
+        return false;
+    }
+
+    uint32 cd = GetRemainingBossResetCooldown(playerGuid);
+    if (cd > 0)
+    {
+        char cdBuf[64];
+        snprintf(cdBuf, sizeof(cdBuf), "Boss reset is on cooldown (%u seconds remaining).", cd);
+        errorReason = cdBuf;
+        return false;
+    }
+
+    // Find active boss in session
+    ObjectGuid bossGuid;
+    for (const auto& sc : session->SpawnedCreatures)
+    {
+        if (sc.IsBoss && !sc.IsDead)
+        {
+            bossGuid = sc.Guid;
+            break;
+        }
+    }
+
+    if (bossGuid.IsEmpty())
+    {
+        errorReason = "No active boss found in this challenge.";
+        return false;
+    }
+
+    Player* player = ObjectAccessor::FindConnectedPlayer(playerGuid);
+    if (!player)
+    {
+        errorReason = "Player not found.";
+        return false;
+    }
+
+    Creature* boss = ObjectAccessor::GetCreature(*player, bossGuid);
+    if (!boss)
+    {
+        errorReason = "Active boss is not currently loaded or in range.";
+        return false;
+    }
+
+    float homeX = boss->GetHomePosition().GetPositionX();
+    float homeY = boss->GetHomePosition().GetPositionY();
+    float homeZ = boss->GetHomePosition().GetPositionZ();
+    float homeO = boss->GetHomePosition().GetOrientation();
+
+    // Stop combat and reset AI state
+    boss->CombatStop(true);
+    boss->GetThreatMgr().ClearAllThreat();
+    boss->GetMotionMaster()->Clear(false);
+    boss->GetMotionMaster()->MoveIdle();
+
+    // Teleport back to spawn
+    boss->NearTeleportTo(homeX, homeY, homeZ, homeO);
+
+    // Heal to full
+    boss->SetHealth(boss->GetMaxHealth());
+
+    // Start 10-minute cooldown
+    SetBossResetCooldown(playerGuid);
+
+    // Notify all players in the instance map
+    Map::PlayerList const& players = boss->GetMap()->GetPlayers();
+    for (auto const& itr : players)
+    {
+        if (Player* p = itr.GetSource())
+        {
+            ChatHandler(p->GetSession()).SendSysMessage(
+                "|cFFFF0000[Dungeon Master]|r Boss " + boss->GetName() + " manually reset by " + player->GetName() + ". Teleported back to spawn point and fully healed.");
+        }
+    }
+
+    LOG_INFO("module", "DungeonMaster: Boss '{}' (Entry {}) reset manually by player '{}'. Teleported back to spawn (z: {:.1f}).",
+        boss->GetName(), boss->GetEntry(), player->GetName(), homeZ);
+
+    return true;
+}
+
+uint32 DungeonMasterMgr::GetRemainingBossResetCooldown(ObjectGuid playerGuid) const
+{
+    std::lock_guard<std::mutex> lock(_bossResetCooldownMutex);
+    auto it = _bossResetCooldowns.find(playerGuid);
+    if (it == _bossResetCooldowns.end())
+        return 0;
+    time_t now = GameTime::GetGameTime().count();
+    return (now < static_cast<time_t>(it->second))
+        ? static_cast<uint32>(it->second - now) : 0;
+}
+
+void DungeonMasterMgr::SetBossResetCooldown(ObjectGuid playerGuid)
+{
+    std::lock_guard<std::mutex> lock(_bossResetCooldownMutex);
+    _bossResetCooldowns[playerGuid] = GameTime::GetGameTime().count() + 600; // 10 minutes
+}
+
+void DungeonMasterMgr::GetActiveBossInfo(ObjectGuid playerGuid, std::string& bossName, float& x, float& y) const
+{
+    bossName = "None";
+    x = 0.0f;
+    y = 0.0f;
+
+    Session* session = const_cast<DungeonMasterMgr*>(this)->GetSessionByPlayer(playerGuid);
+    if (!session)
+        return;
+
+    ObjectGuid bossGuid;
+    for (const auto& sc : session->SpawnedCreatures)
+    {
+        if (sc.IsBoss && !sc.IsDead)
+        {
+            bossGuid = sc.Guid;
+            break;
+        }
+    }
+
+    if (bossGuid.IsEmpty())
+        return;
+
+    Player* player = ObjectAccessor::FindConnectedPlayer(playerGuid);
+    if (!player)
+        return;
+
+    Creature* boss = ObjectAccessor::GetCreature(*player, bossGuid);
+    if (boss)
+    {
+        bossName = boss->GetName();
+        x = boss->GetPositionX();
+        y = boss->GetPositionY();
+    }
 }
 
 bool DungeonMasterMgr::CanCreateNewSession() const

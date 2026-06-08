@@ -65,6 +65,11 @@ public:
     void   ClearCooldown(ObjectGuid playerGuid);
     uint32 GetRemainingCooldown(ObjectGuid playerGuid) const;
 
+    bool   ResetActiveBoss(ObjectGuid playerGuid, std::string& errorReason);
+    uint32 GetRemainingBossResetCooldown(ObjectGuid playerGuid) const;
+    void   SetBossResetCooldown(ObjectGuid playerGuid);
+    void   GetActiveBossInfo(ObjectGuid playerGuid, std::string& bossName, float& x, float& y) const;
+
     // Stats & leaderboard
     PlayerStats GetPlayerStats(ObjectGuid guid) const;
     void        LoadAllPlayerStats();
@@ -94,8 +99,8 @@ public:
 
 private:
     std::vector<SpawnPoint> GetSpawnPointsForMap(uint32 mapId);
-    uint32 SelectCreatureForTheme(const Theme* theme, bool isBoss);
-    uint32 SelectDungeonBoss(const Theme* theme);
+    uint32 SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 targetLevel = 0);
+    uint32 SelectDungeonBoss(const Theme* theme, uint8 targetLevel = 0);
 
     void   GiveGoldReward(Player* player, uint32 amount);
     void   GiveItemReward(Player* player, uint8 rewardLevel, uint8 quality);
@@ -124,6 +129,9 @@ private:
 
     std::unordered_map<ObjectGuid, uint64>   _cooldowns;
     mutable std::mutex _cooldownMutex;
+
+    std::unordered_map<ObjectGuid, uint64>   _bossResetCooldowns;
+    mutable std::mutex _bossResetCooldownMutex;
 
     std::unordered_map<uint32, PlayerStats>  _playerStats;
     mutable std::mutex _statsMutex;
