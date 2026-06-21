@@ -4,6 +4,7 @@
  */
 
 #include "DungeonMasterMgr.h"
+#include "DBCStores.h"
 #include "DMBossSpawnQuery.h"
 #include "RoguelikeMgr.h"
 #include "botmgr.h"
@@ -282,9 +283,11 @@ void DungeonMasterMgr::LoadCreaturePools()
     _bossCreatures.clear();
 
     // Type for theming, rank for boss/trash split, ScriptName='' to avoid scripted mobs
+    // JOIN creature table to ensure we only select creatures that have active spawn entries in the world.
     QueryResult result = WorldDatabase.Query(
-        "SELECT ct.entry, ct.type, ct.minlevel, ct.maxlevel, ct.`rank` "
+        "SELECT DISTINCT ct.entry, ct.type, ct.minlevel, ct.maxlevel, ct.`rank` "
         "FROM creature_template ct "
+        "JOIN creature c ON ct.entry = c.id1 "
         "LEFT JOIN creature_template_movement ctm ON ct.entry = ctm.CreatureId "
         "WHERE ct.type > 0 AND ct.type <= 10 AND ct.type != 8 "       // combat types, skip Critter
         "AND ct.minlevel > 0 AND ct.maxlevel <= 83 "
@@ -335,6 +338,54 @@ void DungeonMasterMgr::LoadCreaturePools()
             e.MaxLevel = f[3].Get<uint8>();
             uint8 rank = f[4].Get<uint8>();
 
+            const CreatureTemplate* cInfo = sObjectMgr->GetCreatureTemplate(e.Entry);
+            if (!cInfo)
+                continue;
+
+            // DBC Model Validation Check to prevent client crashes (Access Violation 0x82C7C9)
+            bool modelValid = true;
+            if (cInfo->Models.empty())
+            {
+                modelValid = false;
+            }
+            else
+            {
+                for (const auto& model : cInfo->Models)
+                {
+                    uint32 displayId = model.CreatureDisplayID;
+                    if (displayId == 0)
+                    {
+                        modelValid = false;
+                        break;
+                    }
+
+                    CreatureDisplayInfoEntry const* displayInfo = sCreatureDisplayInfoStore.LookupEntry(displayId);
+                    if (!displayInfo)
+                    {
+                        modelValid = false;
+                        break;
+                    }
+
+                    if (!sCreatureModelDataStore.LookupEntry(displayInfo->ModelId))
+                    {
+                        modelValid = false;
+                        break;
+                    }
+
+                    if (displayInfo->ExtendedDisplayInfoID)
+                    {
+                        if (!sCreatureDisplayInfoExtraStore.LookupEntry(displayInfo->ExtendedDisplayInfoID))
+                        {
+                            modelValid = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!modelValid)
+                continue;
+
             if (rank == 1 || rank == 2 || rank == 4)        // elite / rare-elite → boss pool
             {
                 _bossCreatures[e.Type].push_back(e);
@@ -344,8 +395,7 @@ void DungeonMasterMgr::LoadCreaturePools()
             {
                 // Strip CREATURE_TYPE_FLAG_BOSS_MOB (0x4) from rank-0 trash so they
                 // don't display as skull-level or use world-boss combat math.
-                const CreatureTemplate* cInfo = sObjectMgr->GetCreatureTemplate(e.Entry);
-                if (cInfo && cInfo->rank == 0 && (cInfo->type_flags & 0x4))
+                if (cInfo->rank == 0 && (cInfo->type_flags & 0x4))
                 {
                     const_cast<CreatureTemplate*>(cInfo)->type_flags &= ~0x4;
                     LOG_INFO("module", "DungeonMaster: Patched in-memory template for trash creature '{}' (entry {}) to strip CREATURE_TYPE_FLAG_BOSS_MOB flag.",
@@ -442,9 +492,56 @@ void DungeonMasterMgr::LoadDungeonBossPool()
         e.MinLevel = f[3].Get<uint8>();
         e.MaxLevel = f[4].Get<uint8>();
 
-        // Strip CREATURE_TYPE_FLAG_BOSS_MOB (0x4) from bosses so they don't display as skull level
         const CreatureTemplate* cInfo = sObjectMgr->GetCreatureTemplate(e.Entry);
-        if (cInfo && (cInfo->type_flags & 0x4))
+        if (!cInfo)
+            continue;
+
+        // DBC Model Validation Check to prevent client crashes (Access Violation 0x82C7C9)
+        bool modelValid = true;
+        if (cInfo->Models.empty())
+        {
+            modelValid = false;
+        }
+        else
+        {
+            for (const auto& model : cInfo->Models)
+            {
+                uint32 displayId = model.CreatureDisplayID;
+                if (displayId == 0)
+                {
+                    modelValid = false;
+                    break;
+                }
+
+                CreatureDisplayInfoEntry const* displayInfo = sCreatureDisplayInfoStore.LookupEntry(displayId);
+                if (!displayInfo)
+                {
+                    modelValid = false;
+                    break;
+                }
+
+                if (!sCreatureModelDataStore.LookupEntry(displayInfo->ModelId))
+                {
+                    modelValid = false;
+                    break;
+                }
+
+                if (displayInfo->ExtendedDisplayInfoID)
+                {
+                    if (!sCreatureDisplayInfoExtraStore.LookupEntry(displayInfo->ExtendedDisplayInfoID))
+                    {
+                        modelValid = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!modelValid)
+            continue;
+
+        // Strip CREATURE_TYPE_FLAG_BOSS_MOB (0x4) from bosses so they don't display as skull level
+        if (cInfo->type_flags & 0x4)
         {
             const_cast<CreatureTemplate*>(cInfo)->type_flags &= ~0x4;
             LOG_INFO("module", "DungeonMaster: Patched in-memory template for boss creature '{}' (entry {}) to strip CREATURE_TYPE_FLAG_BOSS_MOB flag.",
