@@ -18,4 +18,5 @@ UI\ControlsPanel.lua
 UI\MasteryPanel.lua
 UI\MythicPlusFrame.lua
 UI\TrackerFrame.lua
+UI\FeedbackRefinement.lua
 ACChallengePanel.lua

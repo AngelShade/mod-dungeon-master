@@ -2237,7 +2237,34 @@ void DungeonMasterMgr::HandlePlayerDeath(Player* player, Session* session)
     if (!player || !session) return;
 
     if (PlayerSessionData* pd = session->GetPlayerData(player->GetGUID()))
+    {
         ++pd->Deaths;
+
+        // Transmit death recap payload (last 3 hits)
+        std::string payload = "DMDATA:DEATHRECAP:";
+        bool first = true;
+        for (const auto& hit : pd->RecentHits)
+        {
+            if (!first)
+                payload += "|";
+            first = false;
+
+            std::string escapedSource = hit.SourceName;
+            for (char& c : escapedSource)
+            {
+                if (c == ',' || c == '|')
+                    c = ' ';
+            }
+
+            payload += escapedSource + "," + std::to_string(hit.Damage) + "," +
+                       std::to_string(hit.SpellId) + "," + std::to_string(hit.School);
+        }
+
+        if (player->GetSession())
+        {
+            ChatHandler(player->GetSession()).SendSysMessage(payload);
+        }
+    }
 
     // Block release-spirit; auto-rez instead
     player->SetFlag(PLAYER_FIELD_BYTES, PLAYER_FIELD_BYTE_NO_RELEASE_WINDOW);
@@ -2439,9 +2466,66 @@ void DungeonMasterMgr::DistributeRewards(Session* session)
 
     uint8 rewardLevel = static_cast<uint8>(std::min<uint32>(lvl, 80));
 
+    // --- Phase 4 Grade Calculation ---
+    uint32 parTime = expectedTime > 0 ? expectedTime : 300;
+    uint32 totalDeaths = 0;
+    for (const auto& pd : session->Players)
+        totalDeaths += pd.Deaths;
+
+    uint64 totalDamageDealt = 0;
+    uint64 totalDamageTaken = 0;
+    for (const auto& pd : session->Players)
+    {
+        totalDamageDealt += pd.DamageDealt;
+        totalDamageTaken += pd.DamageTaken;
+    }
+    double efficiency = (double)totalDamageDealt / std::max<uint64>(1, totalDamageTaken);
+
+    // Grade components
+    uint32 timePts = 0;
+    if (elapsed <= parTime * 0.7) timePts = 4;
+    else if (elapsed <= parTime * 1.0) timePts = 3;
+    else if (elapsed <= parTime * 1.3) timePts = 2;
+    else if (elapsed <= parTime * 1.6) timePts = 1;
+
+    uint32 deathPts = 0;
+    if (totalDeaths == 0) deathPts = 4;
+    else if (totalDeaths <= 1) deathPts = 3;
+    else if (totalDeaths <= 3) deathPts = 2;
+    else if (totalDeaths <= 5) deathPts = 1;
+
+    uint32 effPts = 0;
+    if (efficiency >= 5.0) effPts = 4;
+    else if (efficiency >= 3.0) effPts = 3;
+    else if (efficiency >= 2.0) effPts = 2;
+    else if (efficiency >= 1.0) effPts = 1;
+
+    uint32 totalPts = timePts + deathPts + effPts;
+    std::string grade = "D";
+    float gradeMult = 0.70f;
+
+    if (totalPts >= 11) { grade = "S"; gradeMult = 1.25f; }
+    else if (totalPts >= 8) { grade = "A"; gradeMult = 1.10f; }
+    else if (totalPts >= 5) { grade = "B"; gradeMult = 1.00f; }
+    else if (totalPts >= 2) { grade = "C"; gradeMult = 0.85f; }
+
+    // Send DMDATA:GRADE payload
+    char gradeBuf[256];
+    snprintf(gradeBuf, sizeof(gradeBuf), "DMDATA:GRADE:%s,%u,%u,%u,%.2f",
+             grade.c_str(), elapsed, parTime, totalDeaths, efficiency);
+
+    for (const auto& pd : session->Players)
+    {
+        Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+        if (p && p->GetSession())
+        {
+            ChatHandler(p->GetSession()).SendSysMessage(gradeBuf);
+        }
+    }
+
     LOG_INFO("module", "DungeonMaster: DistributeRewards — EffectiveLevel={}, rewardLevel={}, "
-        "rewardPool={} items, players={}, elapsed={}s, expected={}s, speedMult={:.2f}",
-        lvl, rewardLevel, _rewardItems.size(), session->Players.size(), elapsed, expectedTime, speedMult);
+        "rewardPool={} items, players={}, elapsed={}s, expected={}s, speedMult={:.2f}, grade={}, gradeMult={:.2f}",
+        lvl, rewardLevel, _rewardItems.size(), session->Players.size(), elapsed, expectedTime, speedMult, grade, gradeMult);
 
     for (const auto& pd : session->Players)
     {
@@ -2468,12 +2552,12 @@ void DungeonMasterMgr::DistributeRewards(Session* session)
         if (session->GambitPacifist) active_gambit_count++;
         float gambitMult = 1.0f + 0.25f * active_gambit_count;
 
-        // Gold goes directly to wallet (scaled by history fatigue, clear speed, and gambits)
-        uint32 finalGold = static_cast<uint32>(perPlayer * fatigueMult * speedMult * gambitMult);
+        // Gold goes directly to wallet (scaled by history fatigue, clear speed, gambits, and grade)
+        uint32 finalGold = static_cast<uint32>(perPlayer * fatigueMult * speedMult * gambitMult * gradeMult);
         GiveGoldReward(p, finalGold);
 
-        // Item drop chance: roll epic first, then rare, fallback green (scaled by history fatigue and gambits)
-        uint32 finalItemChance = static_cast<uint32>(sDMConfig->GetItemChance() * fatigueMult * gambitMult);
+        // Item drop chance: roll epic first, then rare, fallback green (scaled by history fatigue, gambits, and grade)
+        uint32 finalItemChance = static_cast<uint32>(sDMConfig->GetItemChance() * fatigueMult * gambitMult * gradeMult);
         uint32 rewardedItemId = 0;
         bool isMailed = false;
         if (RandInt<uint32>(1, 100) <= finalItemChance)

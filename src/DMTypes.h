@@ -104,6 +104,15 @@ struct PendingPhaseCheck
     bool        Resolved   = false;
 };
 
+struct DamageHit
+{
+    std::string SourceName;
+    uint32      Damage = 0;
+    uint32      SpellId = 0;
+    uint32      School = 0;
+    uint32      Timestamp = 0;
+};
+
 struct PlayerSessionData
 {
     ObjectGuid  PlayerGuid;
@@ -112,6 +121,9 @@ struct PlayerSessionData
     uint32      MobsKilled   = 0;
     uint32      BossesKilled = 0;
     uint32      Deaths       = 0;
+    uint64      DamageDealt  = 0;
+    uint64      DamageTaken  = 0;
+    std::vector<DamageHit> RecentHits;
 };
 
 struct Session

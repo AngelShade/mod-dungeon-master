@@ -29,22 +29,22 @@ class dm_unit_script : public UnitScript
 public:
     dm_unit_script() : UnitScript("dm_unit_script") {}
 
-    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* /*spellInfo*/) override
+    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* spellInfo) override
     {
-        ScaleDamage(target, attacker, damage);
+        ScaleDamage(target, attacker, damage, spellInfo);
     }
 
-    void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* /*spellInfo*/) override
+    void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* spellInfo) override
     {
         if (damage <= 0) return;
         uint32 udmg = static_cast<uint32>(damage);
-        ScaleDamage(target, attacker, udmg);
+        ScaleDamage(target, attacker, udmg, spellInfo);
         damage = static_cast<int32>(udmg);
     }
 
     void ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& damage) override
     {
-        ScaleDamage(target, attacker, damage);
+        ScaleDamage(target, attacker, damage, nullptr);
     }
 
     void OnHeal(Unit* healer, Unit* /*reciever*/, uint32& gain) override
@@ -156,7 +156,7 @@ private:
         return nullptr;
     }
 
-    void ScaleDamage(Unit* target, Unit* attacker, uint32& damage)
+    void ScaleDamage(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* spellInfo = nullptr)
     {
         if (!sDMConfig->IsEnabled() || damage == 0)
             return;
@@ -272,6 +272,42 @@ private:
 
         if (damage == 0)
             damage = 1;
+
+        // --- Track Damage Stats and Recent Hits ---
+        Player* targetPlayer = GetAssociatedPlayer(target);
+        if (targetPlayer && targetSession && targetSession->IsActive())
+        {
+            if (PlayerSessionData* pd = targetSession->GetPlayerData(targetPlayer->GetGUID()))
+            {
+                pd->DamageTaken += damage;
+
+                // Only record the hit in the death recap buffer if it hit the human player directly
+                if (target->IsPlayer())
+                {
+                    DamageHit hit;
+                    hit.SourceName = attacker ? attacker->GetName() : "Environmental / Hazard";
+                    hit.Damage = damage;
+                    hit.SpellId = spellInfo ? spellInfo->Id : 0;
+                    hit.School = spellInfo ? spellInfo->SchoolMask : 1; // SPELL_SCHOOL_MASK_NORMAL is 1 (Physical)
+                    hit.Timestamp = static_cast<uint32>(time(nullptr));
+
+                    pd->RecentHits.push_back(hit);
+                    if (pd->RecentHits.size() > 3)
+                    {
+                        pd->RecentHits.erase(pd->RecentHits.begin());
+                    }
+                }
+            }
+        }
+
+        Player* attackerPlayer = GetAssociatedPlayer(attacker);
+        if (attackerPlayer && attackerSession && attackerSession->IsActive())
+        {
+            if (PlayerSessionData* pd = attackerSession->GetPlayerData(attackerPlayer->GetGUID()))
+            {
+                pd->DamageDealt += damage;
+            }
+        }
     }
 };
 

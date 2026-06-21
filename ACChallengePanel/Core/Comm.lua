@@ -532,6 +532,15 @@ commFrame:SetScript("OnEvent", function(self, event, msg, ...)
         if ACDM.UpdateTrackerUI then
             ACDM.UpdateTrackerUI()
         end
+    elseif prefix == "GRADE" then
+        local grade, elapsed, parTime, deaths, efficiency = strsplit(",", dataStr)
+        if ACDM.ShowFloorGradeFrame then
+            ACDM.ShowFloorGradeFrame(grade, tonumber(elapsed) or 0, tonumber(parTime) or 300, tonumber(deaths) or 0, tonumber(efficiency) or 1.0)
+        end
+    elseif prefix == "DEATHRECAP" then
+        if ACDM.ShowDeathRecap then
+            ACDM.ShowDeathRecap(dataStr)
+        end
     elseif prefix == "NBOARD" or prefix == "RTBOARD" or prefix == "RFBOARD" then
         local fields = { strsplit(",", dataStr) }
         table.insert(ACDM.leaderboard, {
