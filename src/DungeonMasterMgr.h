@@ -143,8 +143,9 @@ public:
 
 private:
     std::vector<SpawnPoint> GetSpawnPointsForMap(uint32 mapId, uint32 dungeonIndex);
-    uint32 SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 bandMin = 1, uint8 bandMax = 83);
-    uint32 SelectDungeonBoss(const Theme* theme, uint8 bandMin = 1, uint8 bandMax = 83);
+    uint32 SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 targetLevel);
+    uint32 SelectDungeonBoss(const Theme* theme, uint8 targetLevel);
+    bool IsExpansionMatch(uint8 creatureMinLevel, uint8 creatureMaxLevel, uint8 targetLevel) const;
 
     void   GiveGoldReward(Player* player, uint32 amount);
     uint32 GiveItemReward(Player* player, uint8 rewardLevel, uint8 quality, bool& outMailed);

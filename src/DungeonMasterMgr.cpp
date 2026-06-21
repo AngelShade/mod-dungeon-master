@@ -1612,7 +1612,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
     {
         if (sp.IsBossPosition) continue;
 
-        uint32 entry = SelectCreatureForTheme(theme, false, bandMin, bandMax);
+        uint32 entry = SelectCreatureForTheme(theme, false, targetLevel);
         if (!entry) continue;
 
         Creature* c = map->SummonCreature(entry, sp.Pos);
@@ -1678,7 +1678,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
             size_t pickIdx  = validRarePoints[RandInt<size_t>(startIdx, endIdx)];
             SpawnPoint& rareSP = session->SpawnPoints[pickIdx];
 
-            uint32 rareEntry = SelectCreatureForTheme(theme, true, bandMin, bandMax);
+            uint32 rareEntry = SelectCreatureForTheme(theme, true, targetLevel);
             if (rareEntry)
             {
                 Creature* r = map->SummonCreature(rareEntry, rareSP.Pos);
@@ -1740,7 +1740,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         if (!sp.IsBossPosition || bossesSpawned >= sDMConfig->GetBossCount())
             continue;
 
-        uint32 entry = SelectDungeonBoss(theme, bandMin, bandMax);
+        uint32 entry = SelectDungeonBoss(theme, targetLevel);
         if (!entry) { LOG_WARN("module", "DungeonMaster: No boss candidate."); continue; }
 
         Creature* b = map->SummonCreature(entry, sp.Pos);
@@ -1848,7 +1848,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
 }
 
 // Select a creature matching the theme
-uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 bandMin, uint8 bandMax)
+uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 targetLevel)
 {
     if (!theme) return 0;
 
@@ -1920,11 +1920,11 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
         }
     }
 
-    // Now filter candidates by level band [bandMin, bandMax]
+    // Now filter candidates by expansion match
     std::vector<uint32> filtered;
     for (const auto& e : candidates)
     {
-        if (e.MaxLevel >= bandMin && e.MinLevel <= bandMax)
+        if (IsExpansionMatch(e.MinLevel, e.MaxLevel, targetLevel))
         {
             filtered.push_back(e.Entry);
         }
@@ -1932,16 +1932,16 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
 
     if (!filtered.empty())
     {
-        LOG_DEBUG("module", "DungeonMaster: {} level-matching candidates for theme '{}' (boss={}, band {}-{})",
-            filtered.size(), theme->Name, isBoss, bandMin, bandMax);
+        LOG_DEBUG("module", "DungeonMaster: {} expansion-matching candidates for theme '{}' (boss={}, targetLevel={})",
+            filtered.size(), theme->Name, isBoss, targetLevel);
         return filtered[RandInt<size_t>(0, filtered.size() - 1)];
     }
 
-    // If no exact level-matching candidates, fall back to any level candidate
+    // If no exact expansion-matching candidates, fall back to any candidate
     if (!candidates.empty())
     {
-        LOG_WARN("module", "DungeonMaster: No level-matching creatures for theme '{}' (band {}-{}) — using fallback.",
-            theme->Name, bandMin, bandMax);
+        LOG_WARN("module", "DungeonMaster: No expansion-matching creatures for theme '{}' (targetLevel={}) — using fallback.",
+            theme->Name, targetLevel);
         return candidates[RandInt<size_t>(0, candidates.size() - 1)].Entry;
     }
 
@@ -1950,7 +1950,7 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
     return 0;
 }
 
-uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 bandMin, uint8 bandMax)
+uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 targetLevel)
 {
     if (!theme) return 0;
 
@@ -1986,27 +1986,27 @@ uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 bandMin, ui
                 candidates.push_back(e);
     }
 
-    // Filter by level band
+    // Filter by expansion match
     std::vector<uint32> filtered;
     for (const auto& e : candidates)
     {
-        if (e.MaxLevel >= bandMin && e.MinLevel <= bandMax)
+        if (IsExpansionMatch(e.MinLevel, e.MaxLevel, targetLevel))
             filtered.push_back(e.Entry);
     }
 
     if (!filtered.empty())
     {
         uint32 entry = filtered[RandInt<size_t>(0, filtered.size() - 1)];
-        LOG_DEBUG("module", "DungeonMaster: Selected level-matching dungeon boss entry {} from {} candidates (theme '{}', band {}-{})",
-            entry, filtered.size(), theme->Name, bandMin, bandMax);
+        LOG_DEBUG("module", "DungeonMaster: Selected expansion-matching dungeon boss entry {} from {} candidates (theme '{}', targetLevel={})",
+            entry, filtered.size(), theme->Name, targetLevel);
         return entry;
     }
 
-    // Fallback to any level dungeon boss candidate
+    // Fallback to any dungeon boss candidate
     if (!candidates.empty())
     {
         uint32 entry = candidates[RandInt<size_t>(0, candidates.size() - 1)].Entry;
-        LOG_DEBUG("module", "DungeonMaster: Selected dungeon boss entry {} from {} candidates (fallback, no level match, theme '{}')",
+        LOG_DEBUG("module", "DungeonMaster: Selected dungeon boss entry {} from {} candidates (fallback, no expansion match, theme '{}')",
             entry, candidates.size(), theme->Name);
         return entry;
     }
@@ -2015,7 +2015,7 @@ uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 bandMin, ui
     if (candidates.empty())
     {
         LOG_WARN("module", "DungeonMaster: Dungeon boss pool empty — falling back to generic boss selection.");
-        return SelectCreatureForTheme(theme, true, bandMin, bandMax);
+        return SelectCreatureForTheme(theme, true, targetLevel);
     }
 
     return 0;
@@ -5469,6 +5469,28 @@ float DungeonMasterMgr::GetExpansionGoldMultiplier(uint8 effectiveLevel) const
     }
 
     return levelScale;
+}
+
+bool DungeonMasterMgr::IsExpansionMatch(uint8 creatureMinLevel, uint8 creatureMaxLevel, uint8 targetLevel) const
+{
+    if (targetLevel <= 60)
+    {
+        // Classic dungeon: creature must originally be Classic (level <= 60)
+        return creatureMinLevel <= 60;
+    }
+    else if (targetLevel <= 70)
+    {
+        // TBC dungeon: creature must originally be TBC (level 61-70)
+        // Check if its max level is above 60 to filter out lower level Classic mobs,
+        // and its min level is <= 70 to make sure it's not a WotLK mob.
+        return creatureMaxLevel > 60 && creatureMinLevel <= 70;
+    }
+    else
+    {
+        // WotLK dungeon: creature must originally be WotLK (level 71-83)
+        // Check if its max level is above 70 to filter out Classic/TBC mobs.
+        return creatureMaxLevel > 70;
+    }
 }
 
 } // namespace DungeonMaster
