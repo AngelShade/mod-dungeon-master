@@ -419,6 +419,10 @@ commFrame:SetScript("OnEvent", function(self, event, msg, ...)
         else
             if ACDM.HideGambitSelection then ACDM.HideGambitSelection() end
         end
+
+        if ACDM.flags.inRoguelike ~= 1 and ACDMBranchChoicesFrame then
+            ACDMBranchChoicesFrame:Hide()
+        end
     elseif prefix == "MASTERY" then
         local pts, mask = strsplit(",", dataStr)
         ACDM.masteryPoints = tonumber(pts) or 0

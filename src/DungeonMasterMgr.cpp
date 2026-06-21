@@ -3690,13 +3690,33 @@ void DungeonMasterMgr::CleanupRoguelikeSession(uint32 sessionId, bool success)
 
     Session& s = it->second;
 
-
     UpdatePlayerStatsFromSession(s, success);
     if (success && s.State == SessionState::Completed)
         SaveLeaderboardEntry(s);
 
+    // Despawn creatures from the map
+    Player* pRef = nullptr;
+    for (const auto& pd : s.Players)
+    {
+        pRef = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+        if (pRef)
+            break;
+    }
+    if (pRef)
+    {
+        for (const auto& sc : s.SpawnedCreatures)
+        {
+            if (Creature* c = ObjectAccessor::GetCreature(*pRef, sc.Guid))
+            {
+                c->AddObjectToRemoveList();
+            }
+        }
+    }
 
     uint32 savedInstanceId = s.InstanceId;
+    std::vector<ObjectGuid> playerGuids;
+    for (const auto& pd : s.Players)
+        playerGuids.push_back(pd.PlayerGuid);
 
     // Clean up mappings (no teleport/cooldowns for roguelike)
     if (savedInstanceId != 0)
@@ -3710,6 +3730,8 @@ void DungeonMasterMgr::CleanupRoguelikeSession(uint32 sessionId, bool success)
     }
 
     _activeSessions.erase(it);
+
+    SendInactiveUpdateToPlayers(playerGuids);
 
     LOG_DEBUG("module", "DungeonMaster: Roguelike session {} cleaned up (success={}).",
         sessionId, success);
@@ -4365,8 +4387,8 @@ void DungeonMasterMgr::Update(uint32 diff)
                     }
                 }
 
-                // Decrement preparation timer for roguelike sessions
-                if (session.State == SessionState::Preparing && session.RoguelikeRunId != 0)
+                // Decrement preparation timer for roguelike sessions once instance is loaded/registered
+                if (session.State == SessionState::Preparing && session.RoguelikeRunId != 0 && session.InstanceId != 0)
                 {
                     if (session.PreparationTimer > 0)
                     {

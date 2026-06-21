@@ -8,7 +8,7 @@ function ACDM.ShowBranchingChoices()
 
     if not ACDMBranchChoicesFrame then
         local f = CreateFrame("Frame", "ACDMBranchChoicesFrame", UIParent)
-        f:SetSize(520, 260)
+        f:SetSize(520, 280)
         f:SetPoint("CENTER", UIParent, "CENTER", 0, 100)
         f:SetFrameStrata("DIALOG")
         f:SetMovable(true)
@@ -100,6 +100,19 @@ function ACDM.ShowBranchingChoices()
             f.Cards[i] = card
         end
 
+        -- Exit & Claim Button
+        local exitBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+        exitBtn:SetSize(140, 22)
+        exitBtn:SetPoint("BOTTOM", f, "BOTTOM", 0, 15)
+        exitBtn:SetText("Exit & Claim")
+        exitBtn:SetNormalFontObject("GameFontNormalSmall")
+        exitBtn:SetHighlightFontObject("GameFontHighlightSmall")
+        exitBtn:SetScript("OnClick", function()
+            ACDM.SendCommand(".dm rlquit")
+            f:Hide()
+        end)
+        f.exitBtn = exitBtn
+
         ACDMBranchChoicesFrame = f
     end
 
@@ -118,7 +131,7 @@ function ACDM.ShowBranchingChoices()
         if choice then
             card:Show()
             card:ClearAllPoints()
-            card:SetPoint("LEFT", ACDMBranchChoicesFrame, "LEFT", 25 + (i - 1) * 155, -15)
+            card:SetPoint("LEFT", ACDMBranchChoicesFrame, "LEFT", 25 + (i - 1) * 155, -10)
             
             -- Lookup dungeon name
             local dungeonName = "Unknown Dungeon"

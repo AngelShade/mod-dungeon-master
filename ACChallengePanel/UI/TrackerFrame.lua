@@ -573,11 +573,8 @@ function ACDM.CreateTrackerFrame()
             end
         end
 
-        -- Transition Buttons (Roguelike completed floor only)
+        -- Transition Buttons (Roguelike completed floor only - disabled in Tracker UI in favor of branching choices frame)
         local showButtons = false
-        if ACDM.flags.inRoguelike == 1 and ACDM.flags.sessionState == 4 then
-            showButtons = true
-        end
 
         if showButtons then
             tracker.advanceBtn:Show()
