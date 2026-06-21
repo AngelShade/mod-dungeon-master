@@ -102,13 +102,7 @@ public:
         }
 
         // Original logic for dungeon mobs/bosses
-        Player* player = nullptr;
-        if (killer)
-        {
-            player = killer->ToPlayer();
-            if (!player && killer->GetOwner())
-                player = killer->GetOwner()->ToPlayer();
-        }
+        Player* player = GetAssociatedPlayer(killer);
 
         Session* session = nullptr;
         if (player)
@@ -130,27 +124,28 @@ private:
             return nullptr;
 
         Player* p = unit->ToPlayer();
-        if (!p && unit->GetTypeId() == TYPEID_UNIT && unit->ToCreature()->IsNPCBot())
+        if (p)
+            return p;
+
+        if (unit->GetOwner())
+        {
+            p = unit->GetOwner()->ToPlayer();
+            if (p)
+                return p;
+        }
+
+        if (unit->GetTypeId() == TYPEID_UNIT && unit->ToCreature()->IsNPCBot())
         {
             if (bot_ai* ai = unit->ToCreature()->GetBotAI())
-                p = ai->GetBotOwner();
+                return ai->GetBotOwner();
         }
-        return p;
+
+        return nullptr;
     }
 
     Session* GetDMPlayerSession(Unit* unit)
     {
-        if (!unit)
-            return nullptr;
-
-        Player* p = unit->ToPlayer();
-        if (!p && unit->GetTypeId() == TYPEID_UNIT && unit->ToCreature()->IsNPCBot())
-        {
-            if (bot_ai* ai = unit->ToCreature()->GetBotAI())
-                p = ai->GetBotOwner();
-        }
-
-        if (p)
+        if (Player* p = GetAssociatedPlayer(unit))
             return sDungeonMasterMgr->GetSessionByPlayer(p->GetGUID());
 
         return nullptr;
