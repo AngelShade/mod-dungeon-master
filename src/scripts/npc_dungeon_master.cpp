@@ -57,15 +57,19 @@ enum DMGossipActions
     GOSSIP_ACTION_BOARD_NORMAL        = 10311,  // Normal — Fastest Clears
     GOSSIP_ACTION_BOARD_RL_TIER       = 10312,  // Roguelike — Highest Tier
     GOSSIP_ACTION_BOARD_RL_FLOORS     = 10313,  // Roguelike — Most Floors
+    GOSSIP_ACTION_BESTIARY_MENU       = 10320,
+    GOSSIP_ACTION_FAMILIARITY_MENU    = 10330,
+    GOSSIP_ACTION_BESTIARY_DUNGEON    = 10400, // +dungeonIndex
 };
 
 struct PlayerDMSelection
 {
     uint32 DifficultyId  = 0;
     uint32 ThemeId       = 0;
-    uint32 MapId         = 0;
+    uint32 DungeonIndex  = 0;
     bool   ScaleToParty  = true;
     bool   IsRoguelike   = false;
+    bool   IsRandom      = false;
 };
 
 static std::unordered_map<ObjectGuid, PlayerDMSelection> sSelections;
@@ -193,12 +197,16 @@ public:
         }
         else if (action == GOSSIP_ACTION_DUNGEON_RANDOM)
         {
-            { std::lock_guard<std::mutex> lk(sSelMutex); sSelections[player->GetGUID()].MapId = 0; }
+            { std::lock_guard<std::mutex> lk(sSelMutex);
+              sSelections[player->GetGUID()].DungeonIndex = 0;
+              sSelections[player->GetGUID()].IsRandom = true; }
             ShowConfirmMenu(player, creature);
         }
         else if (action >= GOSSIP_ACTION_DUNGEON_BASE && action < GOSSIP_ACTION_CONFIRM)
         {
-            { std::lock_guard<std::mutex> lk(sSelMutex); sSelections[player->GetGUID()].MapId = action - GOSSIP_ACTION_DUNGEON_BASE; }
+            { std::lock_guard<std::mutex> lk(sSelMutex);
+              sSelections[player->GetGUID()].DungeonIndex = action - GOSSIP_ACTION_DUNGEON_BASE;
+              sSelections[player->GetGUID()].IsRandom = false; }
             ShowConfirmMenu(player, creature);
         }
         else if (action == GOSSIP_ACTION_CONFIRM)
@@ -268,6 +276,12 @@ public:
             ShowRoguelikeLeaderboard(player, creature, false);
         else if (action == GOSSIP_ACTION_BOARD_RL_FLOORS)
             ShowRoguelikeLeaderboard(player, creature, true);
+        else if (action == GOSSIP_ACTION_BESTIARY_MENU)
+            ShowBestiaryMenu(player, creature);
+        else if (action >= GOSSIP_ACTION_BESTIARY_DUNGEON && action < GOSSIP_ACTION_BESTIARY_DUNGEON + 100)
+            ShowBestiaryDungeonDetail(player, creature, action - GOSSIP_ACTION_BESTIARY_DUNGEON);
+        else if (action == GOSSIP_ACTION_FAMILIARITY_MENU)
+            ShowFamiliarityMenu(player, creature);
         return true;
     }
 
@@ -379,7 +393,7 @@ private:
             char buf[128];
             snprintf(buf, sizeof(buf), "%s (Lv %u-%u)", dg->Name.c_str(), dg->MinLevel, dg->MaxLevel);
             AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, buf,
-                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_DUNGEON_BASE + dg->MapId);
+                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_DUNGEON_BASE + dg->Index);
         }
 
         if (dungeons.empty())
@@ -404,8 +418,8 @@ private:
         const Theme*          theme = sDMConfig->GetTheme(sel.ThemeId);
 
         std::string dgName = "Random Dungeon";
-        if (sel.MapId > 0)
-            if (const DungeonInfo* dg = sDMConfig->GetDungeon(sel.MapId))
+        if (!sel.IsRandom)
+            if (const DungeonInfo* dg = sDMConfig->GetDungeon(sel.DungeonIndex))
                 dgName = dg->Name;
 
         Group* g = player->GetGroup();
@@ -461,10 +475,151 @@ private:
         if (sDMConfig->IsRoguelikeEnabled())
             AddGossipItemFor(player, GOSSIP_ICON_TABARD, "|cFF00FFFFMy Roguelike Stats|r",
                 GOSSIP_SENDER_MAIN, GOSSIP_ACTION_STATS_ROGUELIKE);
+        if (sDMConfig->IsBestiaryEnabled())
+            AddGossipItemFor(player, GOSSIP_ICON_TABARD, "My Dungeon Bestiary",
+                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_BESTIARY_MENU);
+        if (sDMConfig->IsRoguelikeEnabled())
+            AddGossipItemFor(player, GOSSIP_ICON_TABARD, "|cFF00FFFFMy Affix Familiarity|r",
+                GOSSIP_SENDER_MAIN, GOSSIP_ACTION_FAMILIARITY_MENU);
         AddGossipItemFor(player, GOSSIP_ICON_TABARD, "|cFFFFD700Leaderboards|r",
             GOSSIP_SENDER_MAIN, GOSSIP_ACTION_BOARD_MENU);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "|cFFFF0000<< Back|r",
             GOSSIP_SENDER_MAIN, GOSSIP_ACTION_CANCEL);
+        SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
+    }
+
+    void ShowBestiaryMenu(Player* player, Creature* creature)
+    {
+        player->PlayerTalkClass->ClearMenus();
+        uint32 guidLow = player->GetGUID().GetCounter();
+        
+        for (const auto& dg : sDMConfig->GetDungeons())
+        {
+            DungeonKnowledgeEntry meta = sDungeonMasterMgr->GetBestiaryMeta(guidLow, dg.MapId);
+            char buf[256];
+            if (meta.RunsStarted > 0)
+            {
+                snprintf(buf, sizeof(buf), "%s (Started: %u, Cleared: %u)",
+                    dg.Name.c_str(), meta.RunsStarted, meta.RunsCompleted);
+                AddGossipItemFor(player, GOSSIP_ICON_INTERACT_1, buf,
+                    GOSSIP_SENDER_MAIN, GOSSIP_ACTION_BESTIARY_DUNGEON + dg.Index);
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf), "%s |cFF808080(Unexplored)|r", dg.Name.c_str());
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, buf,
+                    GOSSIP_SENDER_MAIN, GOSSIP_ACTION_BESTIARY_DUNGEON + dg.Index);
+            }
+        }
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "|cFFFF0000<< Back|r", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_STATS_MENU);
+        SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
+    }
+
+    void ShowBestiaryDungeonDetail(Player* player, Creature* creature, uint32 dungeonIndex)
+    {
+        player->PlayerTalkClass->ClearMenus();
+        uint32 guidLow = player->GetGUID().GetCounter();
+        const DungeonInfo* dg = sDMConfig->GetDungeon(dungeonIndex);
+        if (!dg)
+        {
+            ShowBestiaryMenu(player, creature);
+            return;
+        }
+
+        DungeonKnowledgeEntry meta = sDungeonMasterMgr->GetBestiaryMeta(guidLow, dg->MapId);
+        auto chat = ChatHandler(player->GetSession());
+        char buf[256];
+
+        chat.SendSysMessage("|cFFFFD700═══════════ Dungeon Bestiary Details ═══════════|r");
+        snprintf(buf, sizeof(buf), "  Dungeon: |cFF00FF00%s|r", dg->Name.c_str());
+        chat.SendSysMessage(buf);
+        snprintf(buf, sizeof(buf), "  Runs Started: |cFFFFFFFF%u|r  —  Completed: |cFFFFFFFF%u|r",
+            meta.RunsStarted, meta.RunsCompleted);
+        chat.SendSysMessage(buf);
+        snprintf(buf, sizeof(buf), "  Total Kills: |cFFFFFFFF%u|r", meta.TotalKills);
+        chat.SendSysMessage(buf);
+        snprintf(buf, sizeof(buf), "  Boss Encountered: |cFFFFFFFF%s|r  —  Beaten: |cFFFFFFFF%s|r",
+            meta.BossEncountered ? "|cFF00FF00Yes|r" : "|cFFFF0000No|r",
+            meta.BossBeaten ? "|cFF00FF00Yes|r" : "|cFFFF0000No|r");
+        chat.SendSysMessage(buf);
+        chat.SendSysMessage(" ");
+        chat.SendSysMessage("|cFFFFD700--- Creature Breakdown ---|r");
+
+        struct TypeName { uint32 type; const char* name; };
+        static const TypeName kTypes[] = {
+            { 1, "Beast" }, { 2, "Dragonkin" }, { 3, "Demon" }, { 4, "Elemental" },
+            { 5, "Giant" }, { 6, "Undead" }, { 7, "Humanoid" }, { 9, "Mechanical" }
+        };
+
+        for (const auto& kt : kTypes)
+        {
+            uint32 kills = sDungeonMasterMgr->GetBestiaryKills(guidLow, dg->MapId, kt.type);
+            if (kills > 0)
+            {
+                uint32 tier = 0;
+                if (kills >= sDMConfig->GetBestiaryTier3Kills()) tier = 3;
+                else if (kills >= sDMConfig->GetBestiaryTier2Kills()) tier = 2;
+                else if (kills >= sDMConfig->GetBestiaryTier1Kills()) tier = 1;
+
+                snprintf(buf, sizeof(buf), "  |cFFFFFFFF%s|r Kills: |cFF00FFFF%u|r (Mastery Tier %u/3)", kt.name, kills, tier);
+                chat.SendSysMessage(buf);
+
+                // Display hints based on Mastery Tier
+                if (tier >= 1)
+                {
+                    snprintf(buf, sizeof(buf), "    |cFF00FF00[Tier 1 Hint]|r Basic traits and vulnerabilities discovered.");
+                    chat.SendSysMessage(buf);
+                }
+                if (tier >= 2)
+                {
+                    snprintf(buf, sizeof(buf), "    |cFF00FF00[Tier 2 Hint]|r Specific resistances and spell behaviors noted.");
+                    chat.SendSysMessage(buf);
+                }
+                if (tier >= 3)
+                {
+                    snprintf(buf, sizeof(buf), "    |cFF00FF00[Tier 3 Hint]|r Advanced counter-play: interrupt key spells!");
+                    chat.SendSysMessage(buf);
+                }
+            }
+        }
+        chat.SendSysMessage("|cFFFFD700════════════════════════════════════════════════|r");
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "<< Back to Bestiary", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_BESTIARY_MENU);
+        SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
+    }
+
+    void ShowFamiliarityMenu(Player* player, Creature* creature)
+    {
+        player->PlayerTalkClass->ClearMenus();
+        uint32 guidLow = player->GetGUID().GetCounter();
+        auto chat = ChatHandler(player->GetSession());
+        char buf[256];
+
+        chat.SendSysMessage("|cFF00FFFF═══════════ Affix Familiarity ═══════════|r");
+
+        struct AffixInfo { uint32 id; const char* name; };
+        static const AffixInfo kAffixes[] = {
+            { AFFIX_FORTIFIED, "Fortified" },
+            { AFFIX_TYRANNICAL, "Tyrannical" },
+            { AFFIX_RAGING, "Raging" },
+            { AFFIX_BOLSTERING, "Bolstering" },
+            { AFFIX_SAVAGE, "Savage" }
+        };
+
+        for (const auto& af : kAffixes)
+        {
+            AffixFamiliarityEntry entry = sDungeonMasterMgr->GetAffixFamiliarity(guidLow, af.id);
+            
+            float calcRes = std::min(sDMConfig->GetRoguelikeMaxFamiliarityPct(), entry.Encounters * sDMConfig->GetRoguelikeFamiliarityPerEncounter());
+            entry.ResistancePct = std::max(entry.ResistancePct, calcRes);
+
+            snprintf(buf, sizeof(buf), "  |cFFFF8800%s|r — Encounters: |cFFFFFFFF%u|r — Resistance: |cFF00FF00%.1f%%|r / %.1f%%",
+                af.name, entry.Encounters, entry.ResistancePct, sDMConfig->GetRoguelikeMaxFamiliarityPct());
+            chat.SendSysMessage(buf);
+        }
+        chat.SendSysMessage("|cFF00FFFF══════════════════════════════════════════|r");
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "|cFFFF0000<< Back|r", GOSSIP_SENDER_MAIN, GOSSIP_ACTION_STATS_MENU);
         SendGossipMenuFor(player, DEFAULT_GOSSIP_MESSAGE, creature->GetGUID());
     }
 
@@ -792,12 +947,49 @@ private:
           sel = it->second;
           sSelections.erase(it); }
 
-        const DifficultyTier* diff = sDMConfig->GetDifficulty(sel.DifficultyId);
-        if (!diff || !diff->IsValidForLevel(player->GetLevel()))
+        std::vector<Player*> members;
+        if (Group* g = player->GetGroup())
         {
-            ChatHandler(player->GetSession()).SendSysMessage(
-                "|cFFFF0000[Roguelike]|r Level requirement not met!");
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+            {
+                if (Player* m = ref->GetSource())
+                    members.push_back(m);
+            }
+        }
+        else
+        {
+            members.push_back(player);
+        }
+
+        for (Player* member : members)
+        {
+            if (sDungeonMasterMgr->IsOnCooldown(member->GetGUID()))
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "|cFFFF0000[Roguelike]|r Player %s is on cooldown for %u seconds.",
+                    member->GetName().c_str(), sDungeonMasterMgr->GetRemainingCooldown(member->GetGUID()));
+                ChatHandler(player->GetSession()).SendSysMessage(buf);
+                return;
+            }
+        }
+
+        const DifficultyTier* diff = sDMConfig->GetDifficulty(sel.DifficultyId);
+        if (!diff)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Roguelike]|r Invalid difficulty ID.");
             return;
+        }
+
+        for (Player* member : members)
+        {
+            if (!diff->IsValidForLevel(member->GetLevel()))
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "|cFFFF0000[Roguelike]|r Player %s does not meet the level requirement (%u) for this difficulty.",
+                    member->GetName().c_str(), diff->MinLevel);
+                ChatHandler(player->GetSession()).SendSysMessage(buf);
+                return;
+            }
         }
 
         uint32 runId = 0; // unused, StartRun returns bool
@@ -827,26 +1019,102 @@ private:
           sel = it->second;
           sSelections.erase(it); }
 
-        const DifficultyTier* diff = sDMConfig->GetDifficulty(sel.DifficultyId);
-        if (!diff || !diff->IsValidForLevel(player->GetLevel()))
+        std::vector<Player*> members;
+        if (Group* g = player->GetGroup())
         {
-            ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Dungeon Master]|r Level requirement not met!");
+            for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+            {
+                if (Player* m = ref->GetSource())
+                    members.push_back(m);
+            }
+        }
+        else
+        {
+            members.push_back(player);
+        }
+
+        for (Player* member : members)
+        {
+            if (sDungeonMasterMgr->IsOnCooldown(member->GetGUID()))
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "|cFFFF0000[Dungeon Master]|r Player %s is on cooldown for %u seconds.",
+                    member->GetName().c_str(), sDungeonMasterMgr->GetRemainingCooldown(member->GetGUID()));
+                ChatHandler(player->GetSession()).SendSysMessage(buf);
+                return;
+            }
+        }
+
+        const DifficultyTier* diff = sDMConfig->GetDifficulty(sel.DifficultyId);
+        if (!diff)
+        {
+            ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Dungeon Master]|r Invalid difficulty ID.");
             return;
         }
 
-        // Resolve random dungeon
-        uint32 mapId = sel.MapId;
-        if (mapId == 0)
+        for (Player* member : members)
         {
-            auto dgs = sDMConfig->GetDungeonsForLevel(diff->MinLevel, diff->MaxLevel);
-            if (dgs.empty()) {
-                ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Dungeon Master]|r No dungeons available!");
-                return; }
-            static thread_local std::mt19937 rng{ std::random_device{}() };
-            mapId = dgs[std::uniform_int_distribution<size_t>(0, dgs.size()-1)(rng)]->MapId;
+            if (!diff->IsValidForLevel(member->GetLevel()))
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "|cFFFF0000[Dungeon Master]|r Player %s does not meet the level requirement (%u) for this difficulty.",
+                    member->GetName().c_str(), diff->MinLevel);
+                ChatHandler(player->GetSession()).SendSysMessage(buf);
+                return;
+            }
         }
 
-        Session* s = sDungeonMasterMgr->CreateSession(player, sel.DifficultyId, sel.ThemeId, mapId, sel.ScaleToParty);
+        // Resolve random dungeon
+        uint32 dungeonIndex = sel.DungeonIndex;
+        if (sel.IsRandom)
+        {
+            auto dgs = sDMConfig->GetDungeonsForLevel(diff->MinLevel, diff->MaxLevel);
+            std::vector<const DungeonInfo*> eligibleDungeons;
+            for (const DungeonInfo* dg : dgs)
+            {
+                bool partyEligible = true;
+                for (Player* member : members)
+                {
+                    if (member->GetLevel() < dg->MinLevel)
+                    {
+                        partyEligible = false;
+                        break;
+                    }
+                }
+                if (partyEligible)
+                {
+                    eligibleDungeons.push_back(dg);
+                }
+            }
+
+            if (eligibleDungeons.empty()) {
+                ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Dungeon Master]|r No dungeons available for your party's level range in this difficulty!");
+                return; }
+            static thread_local std::mt19937 rng{ std::random_device{}() };
+            dungeonIndex = eligibleDungeons[std::uniform_int_distribution<size_t>(0, eligibleDungeons.size()-1)(rng)]->Index;
+        }
+        else
+        {
+            const DungeonInfo* dg = sDMConfig->GetDungeon(dungeonIndex);
+            if (!dg || !dg->IsAvailable)
+            {
+                ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Dungeon Master]|r Invalid or unavailable dungeon.");
+                return;
+            }
+            for (Player* member : members)
+            {
+                if (member->GetLevel() < dg->MinLevel)
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "|cFFFF0000[Dungeon Master]|r Player %s is too low level for this dungeon (requires %u).",
+                        member->GetName().c_str(), dg->MinLevel);
+                    ChatHandler(player->GetSession()).SendSysMessage(buf);
+                    return;
+                }
+            }
+        }
+
+        Session* s = sDungeonMasterMgr->CreateSession(player, sel.DifficultyId, sel.ThemeId, dungeonIndex, sel.ScaleToParty);
         if (!s) {
             ChatHandler(player->GetSession()).SendSysMessage("|cFFFF0000[Dungeon Master]|r Failed to create session!");
             return; }
@@ -862,7 +1130,7 @@ private:
         if (sDMConfig->ShouldAnnounceCompletion())
         {
             const Theme* theme = sDMConfig->GetTheme(sel.ThemeId);
-            const DungeonInfo* dg = sDMConfig->GetDungeon(mapId);
+            const DungeonInfo* dg = sDMConfig->GetDungeon(dungeonIndex);
             char buf[256];
             snprintf(buf, sizeof(buf),
                 "|cFF00FF00[Dungeon Master]|r |cFFFFFFFF%s|r started a |cFFFFD700%s|r |cFF00FFFF%s|r challenge!",

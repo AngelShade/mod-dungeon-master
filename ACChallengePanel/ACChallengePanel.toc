@@ -1,0 +1,21 @@
+## Interface: 30300
+## Title: AC Challenge Panel
+## Notes: Golden framed control panel for Dungeon Master and Mythic Plus server commands.
+## Author: AC Local
+## Version: 2.0.0
+## SavedVariables: ACChallengePanelDB
+
+Core\Config.lua
+Core\Comm.lua
+UI\MainFrame.lua
+UI\ChallengeFlow.lua
+UI\RoguelikeFlow.lua
+UI\RoguelikeBranching.lua
+UI\RoguelikeGambits.lua
+UI\ActiveRunPanel.lua
+UI\StatsPanel.lua
+UI\ControlsPanel.lua
+UI\MasteryPanel.lua
+UI\MythicPlusFrame.lua
+UI\TrackerFrame.lua
+ACChallengePanel.lua

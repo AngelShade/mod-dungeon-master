@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "RoguelikeTypes.h"
+
 class Player;
 class Creature;
 class Map;
@@ -65,6 +67,7 @@ struct Theme
 
 struct DungeonInfo
 {
+    uint32      Index       = 0;
     uint32      MapId       = 0;
     std::string Name;
     uint8       MinLevel    = 1;
@@ -120,6 +123,7 @@ struct Session
     uint32  DifficultyId    = 0;
     uint32  ThemeId         = 0;
     uint32  MapId           = 0;
+    uint32  DungeonIndex    = 0;
     uint32  InstanceId      = 0;
     bool    ScaleToParty    = true;
     uint32  RoguelikeRunId  = 0;  // 0 = standalone, >0 = roguelike
@@ -144,6 +148,19 @@ struct Session
     uint32  Wipes       = 0;
 
     Position EntrancePos;
+    bool    GambitTimeTrial = false;
+    bool    GambitGlassCannon = false;
+    bool    GambitPacifist = false;
+    uint32  PreparationTimer = 30;
+    uint64 LastEmptyTime = 0;
+    uint32 LastCountdownAnnounced = 999; // Track countdown milestones to avoid skipping seconds
+
+    uint32  SurvivalBuffStacks = 0;
+    uint32  WipeDebuffStacks   = 0;
+    uint32  WipeDebuffTimer    = 0; // remaining seconds
+    uint32  TimeAlive          = 0; // seconds survived without death
+    bool    RewardsDistributed = false;
+
 
     bool IsSessionCreature(ObjectGuid guid) const
     {
@@ -246,6 +263,21 @@ struct LeaderboardEntry
     uint32      MobsKilled    = 0;
     uint32      BossesKilled  = 0;
     uint32      Deaths        = 0;
+};
+
+struct PlayerMastery
+{
+    uint32 Guid = 0;
+    uint32 MasteryPoints = 0;
+    uint32 PurchasedMask = 0;
+};
+
+struct PersonalBest
+{
+    uint32 Guid = 0;
+    uint32 MapId = 0;
+    uint32 DifficultyId = 0;
+    uint32 ClearTime = 0;
 };
 
 } // namespace DungeonMaster

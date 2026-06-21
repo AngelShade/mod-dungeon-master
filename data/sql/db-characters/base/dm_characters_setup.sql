@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS `dm_roguelike_player_stats` (
     `total_bosses_killed`  INT UNSIGNED NOT NULL DEFAULT 0,
     `total_deaths`         INT UNSIGNED NOT NULL DEFAULT 0,
     `longest_run_time`     INT UNSIGNED NOT NULL DEFAULT 0,  -- seconds
+    `known_affix_mask`     INT UNSIGNED NOT NULL DEFAULT 0,
+    `veto_tokens`          INT UNSIGNED NOT NULL DEFAULT 0,
     PRIMARY KEY (`guid`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -79,6 +81,63 @@ CREATE TABLE IF NOT EXISTS `dm_roguelike_leaderboard` (
     INDEX `idx_tier`   (`tier_reached` DESC, `dungeons_cleared` DESC, `run_duration` ASC),
     INDEX `idx_floors` (`dungeons_cleared` DESC, `tier_reached` DESC),
     INDEX `idx_guid`   (`guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Dungeon Bestiary (creature kills per map and creature type)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `dm_dungeon_bestiary` (
+    `guid`          INT UNSIGNED NOT NULL,
+    `map_id`        INT UNSIGNED NOT NULL,
+    `creature_type` INT UNSIGNED NOT NULL,
+    `kill_count`    INT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (`guid`, `map_id`, `creature_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Dungeon Bestiary Meta (milestones and overall stats per map)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `dm_dungeon_bestiary_meta` (
+    `guid`             INT UNSIGNED NOT NULL,
+    `map_id`           INT UNSIGNED NOT NULL,
+    `boss_encountered` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `boss_beaten`      TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `total_kills`      INT UNSIGNED NOT NULL DEFAULT 0,
+    `runs_started`     INT UNSIGNED NOT NULL DEFAULT 0,
+    `runs_completed`   INT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (`guid`, `map_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Affix Familiarity (persists encounter stats and calculated resistance for affixes)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `dm_affix_familiarity` (
+    `guid`           INT UNSIGNED NOT NULL,
+    `affix_id`       INT UNSIGNED NOT NULL,
+    `encounters`     INT UNSIGNED NOT NULL DEFAULT 0,
+    `resistance_pct` FLOAT NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (`guid`, `affix_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Player Mastery (meta-progression points and purchased perks mask)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `dm_player_mastery` (
+    `guid`           INT UNSIGNED NOT NULL,
+    `mastery_points` INT UNSIGNED NOT NULL DEFAULT 0,
+    `purchased_mask` INT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (`guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Personal Bests (fastest floor/run times per map/difficulty)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `dm_personal_bests` (
+    `guid`          INT UNSIGNED NOT NULL,
+    `map_id`        INT UNSIGNED NOT NULL,
+    `difficulty_id` INT UNSIGNED NOT NULL,
+    `clear_time`    INT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (`guid`, `map_id`, `difficulty_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------
@@ -106,6 +165,12 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dm_roguelike_leaderboard' AND COLUMN_NAME = 'total_deaths') THEN
         ALTER TABLE `dm_roguelike_leaderboard` ADD COLUMN `total_deaths` INT UNSIGNED NOT NULL DEFAULT 0 AFTER `total_bosses`;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dm_roguelike_player_stats' AND COLUMN_NAME = 'known_affix_mask') THEN
+        ALTER TABLE `dm_roguelike_player_stats` ADD COLUMN `known_affix_mask` INT UNSIGNED NOT NULL DEFAULT 0 AFTER `longest_run_time`;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dm_roguelike_player_stats' AND COLUMN_NAME = 'veto_tokens') THEN
+        ALTER TABLE `dm_roguelike_player_stats` ADD COLUMN `veto_tokens` INT UNSIGNED NOT NULL DEFAULT 0 AFTER `known_affix_mask`;
     END IF;
 END //
 DELIMITER ;

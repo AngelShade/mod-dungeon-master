@@ -26,6 +26,30 @@ enum class RoguelikeRunState : uint8
     Ended
 };
 
+enum class RiskLevel : uint8
+{
+    Unknown = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3
+};
+
+struct BranchOption
+{
+    uint32 DungeonIndex = 0;
+    uint32 ThemeId = 0;
+    RiskLevel Risk = RiskLevel::Unknown;
+    bool ThemeDiscovered = false;
+};
+
+enum class FloorModifier : uint8
+{
+    None = 0,
+    TimeTrial = 1,
+    GlassCannon = 2,
+    Pacifist = 3
+};
+
 enum RoguelikeAffix : uint32
 {
     AFFIX_NONE        = 0,
@@ -76,9 +100,16 @@ struct RoguelikeRun
     uint32  CurrentTier          = 1;
     uint32  CurrentSessionId     = 0;
     uint32  DungeonsCleared      = 0;
-    uint32  PreviousMapId        = 0;
+    uint32  PreviousDungeonIndex = 0;
 
     uint32  BuffStacks = 0;                 // +10% all stats per stack (BoK aura with visual stacks)
+    uint32  SurvivalBuffStacks = 0;
+    uint32  WipeDebuffStacks   = 0;
+    uint32  WipeDebuffTimer    = 0;
+    uint32  Wipes              = 0; // Accumulated wipes (lives used)
+
+    bool    AwaitingBranchSelection = false;
+    std::vector<BranchOption> BranchChoices;
 
     std::vector<RoguelikeAffix> ActiveAffixes;
     std::vector<RoguelikePlayerData> Players;
@@ -118,6 +149,35 @@ struct RoguelikePlayerStats
     uint32 TotalBossesKilled  = 0;
     uint32 TotalDeaths        = 0;
     uint32 LongestRunTime     = 0;  // seconds
+    uint32 KnownAffixMask     = 0;
+    uint32 VetoTokens         = 0;
+};
+
+struct DungeonBestiary
+{
+    uint32 Guid          = 0;
+    uint32 MapId         = 0;
+    uint32 CreatureType  = 0;
+    uint32 KillCount     = 0;
+};
+
+struct DungeonKnowledgeEntry
+{
+    uint32 Guid            = 0;
+    uint32 MapId           = 0;
+    bool   BossEncountered = false;
+    bool   BossBeaten      = false;
+    uint32 TotalKills      = 0;
+    uint32 RunsStarted     = 0;
+    uint32 RunsCompleted   = 0;
+};
+
+struct AffixFamiliarityEntry
+{
+    uint32 Guid          = 0;
+    uint32 AffixId       = 0;
+    uint32 Encounters    = 0;
+    float  ResistancePct = 0.0f;
 };
 
 struct RoguelikeLeaderboardEntry

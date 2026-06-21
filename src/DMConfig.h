@@ -42,9 +42,10 @@ public:
 
     // --- Dungeons ---
     const std::vector<DungeonInfo>&     GetDungeons() const { return _dungeons; }
-    const DungeonInfo*                  GetDungeon(uint32 mapId) const;
+    const DungeonInfo*                  GetDungeon(uint32 index) const;
     std::vector<const DungeonInfo*>     GetDungeonsForLevel(uint8 minLevel, uint8 maxLevel) const;
     bool                                IsDungeonAllowed(uint32 mapId) const;
+    bool                                IsDungeonMap(uint32 mapId) const;
 
     // --- Scaling ---
     uint8 GetLevelBand()          const { return _levelBand; }
@@ -55,6 +56,7 @@ public:
     float GetEliteDamageMult()    const { return _eliteDamageMult; }
     float GetBossHealthMult()     const { return _bossHealthMult; }
     float GetBossDamageMult()     const { return _bossDamageMult; }
+    float GetBaseHealthMult()     const { return _baseHealthMult; }
 
     // --- Rewards ---
     uint32 GetBaseGold()     const { return _baseGold; }
@@ -101,6 +103,21 @@ public:
     uint32 GetRoguelikeMaxBuffs()           const { return _roguelikeMaxBuffs; }
     const std::vector<RoguelikeBuff>& GetRoguelikeBuffPool() const { return _roguelikeBuffPool; }
     bool   IsRoguelikeVendorEnabled()       const { return _roguelikeVendorEnabled; }
+    uint32 GetRoguelikeRevealAffixTier()    const { return _roguelikeRevealAffixTier; }
+    bool   IsBestiaryEnabled()              const { return _bestiaryEnabled; }
+    uint32 GetBestiaryTier1Kills()          const { return _bestiaryTier1Kills; }
+    uint32 GetBestiaryTier2Kills()          const { return _bestiaryTier2Kills; }
+    uint32 GetBestiaryTier3Kills()          const { return _bestiaryTier3Kills; }
+    float  GetRoguelikeFamiliarityPerEncounter() const { return _roguelikeFamiliarityPerEncounter; }
+    float  GetRoguelikeMaxFamiliarityPct()   const { return _roguelikeMaxFamiliarityPct; }
+
+    uint32 GetRoguelikeBranchChoices()       const { return _roguelikeBranchChoices; }
+    bool   IsGambitsEnabled()                const { return _gambitsEnable; }
+    uint32 GetGambitsMaxPerFloor()           const { return _gambitsMaxPerFloor; }
+    uint32 GetGambitsTimeTrialMinutes()      const { return _gambitsTimeTrialMinutes; }
+    uint32 GetRoguelikeVetoUnlockTier()      const { return _roguelikeVetoUnlockTier; }
+    uint32 GetRoguelikeFloorsPerVeto()       const { return _roguelikeFloorsPerVeto; }
+    uint32 GetRoguelikeMaxVetoTokens()       const { return _roguelikeMaxVetoTokens; }
 
 private:
     void LoadDifficulties();
@@ -126,6 +143,7 @@ private:
     float _perPlayerHealth = 0.25f;
     float _perPlayerDamage = 0.10f;
     float _soloMultiplier  = 0.50f;
+    float _baseHealthMult  = 4.0f;
     float _eliteHealthMult = 2.0f;
     float _eliteDamageMult = 1.5f;
     float _bossHealthMult  = 8.0f;
@@ -175,6 +193,20 @@ private:
     uint32 _roguelikeSecondAffixTier  = 7;
     uint32 _roguelikeThirdAffixTier   = 10;
     uint32 _roguelikeMaxBuffs         = 20;
+    uint32 _roguelikeRevealAffixTier  = 5;
+    bool   _bestiaryEnabled           = true;
+    uint32 _bestiaryTier1Kills        = 50;
+    uint32 _bestiaryTier2Kills        = 100;
+    uint32 _bestiaryTier3Kills        = 250;
+    float  _roguelikeFamiliarityPerEncounter = 1.0f;
+    float  _roguelikeMaxFamiliarityPct = 15.0f;
+    uint32 _roguelikeBranchChoices = 3;
+    bool   _gambitsEnable          = true;
+    uint32 _gambitsMaxPerFloor     = 2;
+    uint32 _gambitsTimeTrialMinutes = 10;
+    uint32 _roguelikeVetoUnlockTier = 5;
+    uint32 _roguelikeFloorsPerVeto  = 3;
+    uint32 _roguelikeMaxVetoTokens  = 5;
     std::vector<RoguelikeBuff> _roguelikeBuffPool;
 };
 

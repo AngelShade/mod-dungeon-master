@@ -29,6 +29,7 @@ public:
     // Run lifecycle
     bool StartRun(Player* leader, uint32 difficultyId, uint32 themeId, bool scaleToParty = true);
     void OnDungeonCompleted(uint32 runId, uint32 sessionId);
+    void FinalizeCompletedFloor(uint32 runId);
     void OnPartyWipe(uint32 runId);
     void EndRun(uint32 runId, bool announceResults);
     void AbandonRun(uint32 runId);
@@ -49,6 +50,7 @@ public:
                               float& outEliteChanceMult) const;
     bool        HasActiveAffixes(uint32 runId) const;
     std::string GetActiveAffixNames(uint32 runId) const;
+    std::string GetActiveAffixNamesForPlayer(uint32 runId, ObjectGuid playerGuid) const;
 
     // Buff system
     void IncrementBuffStacks(uint32 runId);
@@ -71,12 +73,19 @@ public:
     void LoadAllRoguelikePlayerStats();
     RoguelikePlayerStats GetRoguelikePlayerStats(ObjectGuid guid) const;
     void UpdateRoguelikePlayerStats(const RoguelikeRun& run);
+    bool ConsumeVetoToken(ObjectGuid playerGuid);
+    bool VetoAffixForRun(uint32 runId, uint32 vetoedAffixId, std::string& outNewAffixName);
+    void ClearTransitionTime(uint32 runId);
 
 private:
     void BuildAffixPool();
     void SelectAffixesForTier(RoguelikeRun& run);
     uint32 SelectRandomDungeon(const RoguelikeRun& run) const;
-    bool TransitionToNextDungeon(RoguelikeRun& run);
+    void GenerateBranchChoices(RoguelikeRun& run);
+    void SendBranchChoicesToParty(const RoguelikeRun& run);
+public:
+    bool TransitionToNextDungeon(RoguelikeRun& run, uint32 dungeonIndex, uint32 themeId);
+private:
     void TeleportRunPlayersOut(RoguelikeRun& run);
     void AnnounceCountdown(const RoguelikeRun& run, uint32 remainingSec);
     void AnnounceToRun(const RoguelikeRun& run, const char* msg);

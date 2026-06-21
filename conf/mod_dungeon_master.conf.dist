@@ -1,3 +1,4 @@
+[worldserver]
 ########################################
 # DUNGEON MASTER MODULE CONFIGURATION
 ########################################
@@ -30,16 +31,16 @@ DungeonMaster.NpcEntry = 500000
 # Format: "Name,MinLevel,MaxLevel,HealthMult,DamageMult,RewardMult,MobMult"
 ###############################################################################
 
-DungeonMaster.Difficulty.1 = "Novice,10,19,0.6,0.6,1.0,0.5"
-DungeonMaster.Difficulty.2 = "Apprentice,20,29,0.8,0.8,1.5,0.7"
-DungeonMaster.Difficulty.3 = "Journeyman,30,44,1.0,1.0,2.0,0.85"
-DungeonMaster.Difficulty.4 = "Expert,45,59,1.3,1.2,3.0,1.0"
-DungeonMaster.Difficulty.5 = "Master,60,69,1.6,1.4,4.0,1.0"
-DungeonMaster.Difficulty.6 = "Grandmaster,70,80,2.0,1.6,6.0,1.2"
-DungeonMaster.Difficulty.7 = ""
-DungeonMaster.Difficulty.8 = ""
-DungeonMaster.Difficulty.9 = ""
-DungeonMaster.Difficulty.10 = ""
+DungeonMaster.Difficulty.1 = "Novice,15,20,0.6,0.6,1.0,0.5"
+DungeonMaster.Difficulty.2 = "Apprentice,21,25,0.7,0.7,1.2,0.6"
+DungeonMaster.Difficulty.3 = "Journeyman,26,32,0.85,0.85,1.5,0.7"
+DungeonMaster.Difficulty.4 = "Adept,33,39,1.0,1.0,1.8,0.8"
+DungeonMaster.Difficulty.5 = "Expert,40,47,1.15,1.15,2.2,0.9"
+DungeonMaster.Difficulty.6 = "Veteran,48,54,1.3,1.25,2.7,1.0"
+DungeonMaster.Difficulty.7 = "Champion,55,60,1.5,1.4,3.3,1.0"
+DungeonMaster.Difficulty.8 = "Master,61,67,1.7,1.5,4.0,1.1"
+DungeonMaster.Difficulty.9 = "Grandmaster,68,74,1.9,1.6,5.0,1.2"
+DungeonMaster.Difficulty.10 = "Legend,75,80,2.2,1.8,6.5,1.3"
 
 ###############################################################################
 # SCALING
@@ -75,6 +76,11 @@ DungeonMaster.Scaling.PerPlayerDamage = 0.1
 #        Default: 0.5  (creatures have 50% of normal stats)
 DungeonMaster.Scaling.SoloMultiplier = 0.5
 
+#    DungeonMaster.Scaling.BaseHealthMult
+#        Basic creature HP scaling multiplier to set standard trash health
+#        Default: 4.0
+DungeonMaster.Scaling.BaseHealthMult = 4.0
+
 #    DungeonMaster.Scaling.EliteHealthMult
 #        Health multiplier for elite trash mobs (on top of difficulty)
 #        Default: 2.0
@@ -101,13 +107,13 @@ DungeonMaster.Scaling.BossDamageMult = 1.5
 ###############################################################################
 
 #    DungeonMaster.Rewards.BaseGold    (copper)     Default: 50000 (5g)
-DungeonMaster.Rewards.BaseGold = 50000
+DungeonMaster.Rewards.BaseGold = 100000
 
 #    DungeonMaster.Rewards.GoldPerMob  (copper)     Default: 50
-DungeonMaster.Rewards.GoldPerMob = 50
+DungeonMaster.Rewards.GoldPerMob = 100
 
 #    DungeonMaster.Rewards.GoldPerBoss (copper)     Default: 10000 (1g)
-DungeonMaster.Rewards.GoldPerBoss = 10000
+DungeonMaster.Rewards.GoldPerBoss = 50000
 
 #    DungeonMaster.Rewards.XPMultiplier             Default: 1.0
 DungeonMaster.Rewards.XPMultiplier = 1.0
@@ -328,13 +334,86 @@ DungeonMaster.Roguelike.VendorEnable = 1
 DungeonMaster.Roguelike.MaxBuffs = 20
 
 # Uncomment and customize to override the default buff pool:
-# DungeonMaster.Roguelike.Buff.1  = "15366,Songflower Serenade,100"
-# DungeonMaster.Roguelike.Buff.2  = "22888,Rallying Cry,80"
-# DungeonMaster.Roguelike.Buff.3  = "24425,Spirit of Zandalar,80"
-# DungeonMaster.Roguelike.Buff.4  = "16609,Warchief's Blessing,80"
-# DungeonMaster.Roguelike.Buff.5  = "23768,Fortune of Damage,60"
-# DungeonMaster.Roguelike.Buff.6  = "20217,Blessing of Kings,90"
-# DungeonMaster.Roguelike.Buff.7  = "48161,Power Word: Fortitude,100"
-# DungeonMaster.Roguelike.Buff.8  = "48469,Gift of the Wild,100"
-# DungeonMaster.Roguelike.Buff.9  = "19506,Trueshot Aura,70"
-# DungeonMaster.Roguelike.Buff.10 = "24932,Leader of the Pack,70"
+DungeonMaster.Roguelike.Buff.1  = ""
+DungeonMaster.Roguelike.Buff.2  = ""
+DungeonMaster.Roguelike.Buff.3  = ""
+DungeonMaster.Roguelike.Buff.4  = ""
+DungeonMaster.Roguelike.Buff.5  = ""
+DungeonMaster.Roguelike.Buff.6  = ""
+DungeonMaster.Roguelike.Buff.7  = ""
+DungeonMaster.Roguelike.Buff.8  = ""
+DungeonMaster.Roguelike.Buff.9  = ""
+DungeonMaster.Roguelike.Buff.10 = ""
+DungeonMaster.Roguelike.Buff.11 = ""
+DungeonMaster.Roguelike.Buff.12 = ""
+DungeonMaster.Roguelike.Buff.13 = ""
+DungeonMaster.Roguelike.Buff.14 = ""
+DungeonMaster.Roguelike.Buff.15 = ""
+
+# --- KNOWLEDGE & BESTIARY SYSTEM ---
+# RevealAffixTier: Tier at which an unknown affix's name is revealed to a player in active runs.
+# Default: 5
+DungeonMaster.Roguelike.RevealAffixTier = 5
+
+# Bestiary.Enable: Enable the dungeon bestiary system.
+# Default: 1
+DungeonMaster.Bestiary.Enable = 1
+
+# Bestiary kill counts required to unlock tactical hints/lore tiers:
+# Tier 1 (e.g. basic traits/immunities revealed)
+# Default: 50
+DungeonMaster.Bestiary.Tier1Kills = 50
+
+# Tier 2 (e.g. details, specific resistances)
+# Default: 100
+DungeonMaster.Bestiary.Tier2Kills = 100
+
+# Tier 3 (e.g. advanced tactical counter-play advice)
+# Default: 250
+DungeonMaster.Bestiary.Tier3Kills = 250
+
+# --- AFFIX FAMILIARITY SYSTEM ---
+# FamiliarityPerEncounter: Percentage resistance gained per completed run with the affix.
+# Default: 1.0 (1%)
+DungeonMaster.Roguelike.FamiliarityPerEncounter = 1.0
+
+# MaxFamiliarityPct: Maximum resistance percentage capping the damage/health benefit from familiarity.
+# Default: 15.0 (15%)
+DungeonMaster.Roguelike.MaxFamiliarityPct = 15.0
+
+# --- ROGUELIKE BRANCHING PATHS, GAMBITS & VETOES ---
+#
+# DungeonMaster.Roguelike.BranchChoices
+#     Number of branch options to display when choosing the next floor.
+#     Default: 3
+DungeonMaster.Roguelike.BranchChoices = 3
+
+# DungeonMaster.Gambits.Enable
+#     Enable the optional Gambit modifiers (Time Trial, Glass Cannon, Pacifist).
+#     Default: 1
+DungeonMaster.Gambits.Enable = 1
+
+# DungeonMaster.Gambits.MaxPerFloor
+#     Maximum number of active Gambits a player/party can choose per floor.
+#     Default: 2
+DungeonMaster.Gambits.MaxPerFloor = 2
+
+# DungeonMaster.Gambits.TimeTrialMinutes
+#     Time limit in minutes for the Time Trial gambit.
+#     Default: 10
+DungeonMaster.Gambits.TimeTrialMinutes = 10
+
+# DungeonMaster.Roguelike.VetoUnlockTier
+#     Tier at which players start accumulating Veto Tokens.
+#     Default: 5
+DungeonMaster.Roguelike.VetoUnlockTier = 5
+
+# DungeonMaster.Roguelike.FloorsPerVeto
+#     Number of floor clears required to earn one Veto Token.
+#     Default: 3
+DungeonMaster.Roguelike.FloorsPerVeto = 3
+
+# DungeonMaster.Roguelike.MaxVetoTokens
+#     Maximum veto tokens a player can hold.
+#     Default: 5
+DungeonMaster.Roguelike.MaxVetoTokens = 5

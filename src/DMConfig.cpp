@@ -6,6 +6,9 @@
 #include "DMConfig.h"
 #include "Config.h"
 #include "Log.h"
+#include "DatabaseEnv.h"
+#include "QueryResult.h"
+#include "Field.h"
 #include <sstream>
 
 namespace DungeonMaster
@@ -60,6 +63,7 @@ void DMConfig::LoadConfig(bool reload)
     _perPlayerHealth = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.PerPlayerHealth",   0.25f);
     _perPlayerDamage = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.PerPlayerDamage",   0.10f);
     _soloMultiplier  = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.SoloMultiplier",    0.50f);
+    _baseHealthMult  = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.BaseHealthMult",    4.0f);
     _eliteHealthMult = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.EliteHealthMult",   2.0f);
     _eliteDamageMult = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.EliteDamageMult",   1.5f);
     _bossHealthMult  = sConfigMgr->GetOption<float> ("DungeonMaster.Scaling.BossHealthMult",    8.0f);
@@ -109,6 +113,22 @@ void DMConfig::LoadConfig(bool reload)
     _roguelikeThirdAffixTier  = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.ThirdAffixTier",     10);
     _roguelikeMaxBuffs        = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.MaxBuffs",            20);
     _roguelikeVendorEnabled = sConfigMgr->GetOption<bool>("DungeonMaster.Roguelike.VendorEnable", true);
+
+    _roguelikeRevealAffixTier = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.RevealAffixTier", 5);
+    _bestiaryEnabled           = sConfigMgr->GetOption<bool>("DungeonMaster.Bestiary.Enable", true);
+    _bestiaryTier1Kills        = sConfigMgr->GetOption<uint32>("DungeonMaster.Bestiary.Tier1Kills", 50);
+    _bestiaryTier2Kills        = sConfigMgr->GetOption<uint32>("DungeonMaster.Bestiary.Tier2Kills", 100);
+    _bestiaryTier3Kills        = sConfigMgr->GetOption<uint32>("DungeonMaster.Bestiary.Tier3Kills", 250);
+    _roguelikeFamiliarityPerEncounter = sConfigMgr->GetOption<float>("DungeonMaster.Roguelike.FamiliarityPerEncounter", 1.0f);
+    _roguelikeMaxFamiliarityPct = sConfigMgr->GetOption<float>("DungeonMaster.Roguelike.MaxFamiliarityPct", 15.0f);
+
+    _roguelikeBranchChoices     = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.BranchChoices", 3);
+    _gambitsEnable              = sConfigMgr->GetOption<bool>("DungeonMaster.Gambits.Enable", true);
+    _gambitsMaxPerFloor         = sConfigMgr->GetOption<uint32>("DungeonMaster.Gambits.MaxPerFloor", 2);
+    _gambitsTimeTrialMinutes    = sConfigMgr->GetOption<uint32>("DungeonMaster.Gambits.TimeTrialMinutes", 10);
+    _roguelikeVetoUnlockTier    = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.VetoUnlockTier", 5);
+    _roguelikeFloorsPerVeto     = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.FloorsPerVeto", 3);
+    _roguelikeMaxVetoTokens     = sConfigMgr->GetOption<uint32>("DungeonMaster.Roguelike.MaxVetoTokens", 5);
 
     // White / black lists
     _dungeonWhitelist.clear();
@@ -210,58 +230,74 @@ void DMConfig::LoadDungeons()
 {
     _dungeons.clear();
 
-    struct Def { uint32 map; const char* name; uint8 lo; uint8 hi; };
+    struct Def {
+        uint32 map;
+        const char* name;
+        uint8 lo;
+        uint8 hi;
+        float x;
+        float y;
+        float z;
+        float o;
+    };
 
     static const Def kDungeons[] =
     {
         // Classic
-        { 389, "Ragefire Chasm",       13, 20 },
-        {  36, "Deadmines",            15, 25 },
-        {  33, "Shadowfang Keep",      18, 28 },
-        {  34, "The Stockade",         20, 30 },
-        {  43, "Wailing Caverns",      15, 28 },
-        {  48, "Blackfathom Deeps",    20, 32 },
-        {  47, "Razorfen Kraul",       25, 35 },
-        {  90, "Gnomeregan",           25, 38 },
-        { 129, "Razorfen Downs",       35, 45 },
-        { 189, "Scarlet Monastery",    30, 45 },
-        {  70, "Uldaman",              38, 50 },
-        { 209, "Zul'Farrak",           42, 52 },
-        { 349, "Maraudon",             40, 52 },
-        { 109, "Sunken Temple",        45, 55 },
-        { 230, "Blackrock Depths",     48, 60 },
-        { 229, "Blackrock Spire",      52, 60 },
-        { 289, "Scholomance",          55, 60 },
-        { 329, "Stratholme",           55, 60 },
+        { 389, "Ragefire Chasm",             13, 20, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  36, "Deadmines",                  15, 25, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  33, "Shadowfang Keep",            18, 28, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  34, "The Stockade",               20, 30, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  43, "Wailing Caverns",            15, 28, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  48, "Blackfathom Deeps",          20, 32, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  47, "Razorfen Kraul",             25, 35, 0.0f, 0.0f, 0.0f, 0.0f },
+        {  90, "Gnomeregan",                 25, 38, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 129, "Razorfen Downs",             35, 45, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 189, "Scarlet Monastery: Graveyard", 30, 38, 1688.99f, 1053.48f, 18.6775f, 0.00117f },
+        { 189, "Scarlet Monastery: Library",   33, 41, 255.346f, -209.09f, 18.6773f, 6.26656f },
+        { 189, "Scarlet Monastery: Armory",    35, 43, 1610.83f, -323.433f, 18.6738f, 6.28022f },
+        { 189, "Scarlet Monastery: Cathedral", 37, 45, 855.683f, 1321.5f, 18.6709f, 0.001747f },
+        {  70, "Uldaman",                    38, 50, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 209, "Zul'Farrak",                 42, 52, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 349, "Maraudon",                   40, 52, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 109, "Sunken Temple",              45, 55, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 230, "Blackrock Depths",           48, 60, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 229, "Blackrock Spire",            52, 60, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 289, "Scholomance",                55, 60, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 329, "Stratholme: Crusader",       55, 60, 3593.15f, -3646.56f, 138.5f, 5.33f },
+        { 329, "Stratholme: Undead",         55, 60, 3395.09f, -3380.25f, 142.702f, 0.1f },
+        { 429, "Dire Maul: East",            54, 60, 44.4499f, -154.822f, -2.71201f, 0.0f },
+        { 429, "Dire Maul: West",            56, 60, -62.9658f, 159.867f, -3.46206f, 3.14788f },
+        { 429, "Dire Maul: North",           57, 60, 255.249f, -16.0561f, -2.58737f, 4.7f },
         // TBC
-        { 543, "Hellfire Ramparts",    58, 70 },
-        { 542, "Blood Furnace",        59, 70 },
-        { 547, "Slave Pens",           60, 70 },
-        { 546, "Underbog",             61, 70 },
-        { 557, "Mana-Tombs",           62, 70 },
-        { 558, "Auchenai Crypts",      63, 70 },
-        { 556, "Sethekk Halls",        65, 70 },
-        { 555, "Shadow Labyrinth",     68, 70 },
-        { 540, "Shattered Halls",      68, 70 },
-        { 553, "Botanica",             68, 70 },
-        { 554, "Mechanar",             68, 70 },
-        { 552, "Arcatraz",             68, 70 },
+        { 543, "Hellfire Ramparts",          58, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 542, "Blood Furnace",              59, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 547, "Slave Pens",                 60, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 546, "Underbog",                   61, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 557, "Mana-Tombs",                 62, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 558, "Auchenai Crypts",            63, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 556, "Sethekk Halls",              65, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 555, "Shadow Labyrinth",           68, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 540, "Shattered Halls",            68, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 553, "Botanica",                   68, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 554, "Mechanar",                   68, 70, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 552, "Arcatraz",                   68, 70, 0.0f, 0.0f, 0.0f, 0.0f },
         // WotLK
-        { 574, "Utgarde Keep",         68, 80 },
-        { 576, "The Nexus",            69, 80 },
-        { 601, "Azjol-Nerub",          70, 80 },
-        { 619, "Ahn'kahet",            71, 80 },
-        { 600, "Drak'Tharon Keep",     72, 80 },
-        { 608, "Violet Hold",          73, 80 },
-        { 604, "Gundrak",              74, 80 },
-        { 599, "Halls of Stone",       75, 80 },
-        { 602, "Halls of Lightning",   77, 80 },
-        { 578, "The Oculus",           77, 80 },
-        { 575, "Utgarde Pinnacle",     78, 80 },
-        { 595, "Culling of Stratholme",78, 80 },
-        { 632, "Forge of Souls",       79, 80 },
-        { 658, "Pit of Saron",         79, 80 },
-        { 668, "Halls of Reflection",  79, 80 },
+        { 574, "Utgarde Keep",               68, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 576, "The Nexus",                  69, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 601, "Azjol-Nerub",                70, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 619, "Ahn'kahet",                  71, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 600, "Drak'Tharon Keep",           72, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 608, "Violet Hold",                73, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 604, "Gundrak",                    74, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 599, "Halls of Stone",             75, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 602, "Halls of Lightning",         77, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 578, "The Oculus",                 77, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 575, "Utgarde Pinnacle",           78, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 595, "Culling of Stratholme",      78, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 632, "Forge of Souls",             79, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 658, "Pit of Saron",               79, 80, 0.0f, 0.0f, 0.0f, 0.0f },
+        { 668, "Halls of Reflection",        79, 80, 0.0f, 0.0f, 0.0f, 0.0f },
     };
 
     for (const auto& d : kDungeons)
@@ -270,10 +306,31 @@ void DMConfig::LoadDungeons()
             continue;
 
         DungeonInfo info;
+        info.Index       = static_cast<uint32>(_dungeons.size());
         info.MapId       = d.map;
         info.Name        = d.name;
         info.MinLevel    = d.lo;
         info.MaxLevel    = d.hi;
+        if (d.x != 0.0f || d.y != 0.0f || d.z != 0.0f)
+        {
+            info.EntrancePos = { d.x, d.y, d.z, d.o };
+        }
+        else
+        {
+            char q[256];
+            snprintf(q, sizeof(q),
+                "SELECT target_position_x, target_position_y, target_position_z, target_orientation "
+                "FROM areatrigger_teleport WHERE target_map = %u LIMIT 1", d.map);
+            if (QueryResult r = WorldDatabase.Query(q))
+            {
+                Field* f = r->Fetch();
+                info.EntrancePos = { f[0].Get<float>(), f[1].Get<float>(), f[2].Get<float>(), f[3].Get<float>() };
+            }
+            else
+            {
+                info.EntrancePos = { 0.0f, 0.0f, 0.0f, 0.0f };
+            }
+        }
         info.IsAvailable = true;
         _dungeons.push_back(info);
     }
@@ -313,10 +370,10 @@ const Theme* DMConfig::GetTheme(uint32 id) const
     return nullptr;
 }
 
-const DungeonInfo* DMConfig::GetDungeon(uint32 mapId) const
+const DungeonInfo* DMConfig::GetDungeon(uint32 index) const
 {
-    for (const auto& d : _dungeons)
-        if (d.MapId == mapId) return &d;
+    if (index < _dungeons.size())
+        return &_dungeons[index];
     return nullptr;
 }
 
@@ -334,6 +391,14 @@ bool DMConfig::IsDungeonAllowed(uint32 mapId) const
     if (_dungeonBlacklist.count(mapId)) return false;
     if (!_dungeonWhitelist.empty() && !_dungeonWhitelist.count(mapId)) return false;
     return true;
+}
+
+bool DMConfig::IsDungeonMap(uint32 mapId) const
+{
+    for (const auto& d : _dungeons)
+        if (d.MapId == mapId)
+            return true;
+    return false;
 }
 
     // sequential entries from DungeonMaster

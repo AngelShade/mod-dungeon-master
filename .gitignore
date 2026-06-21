@@ -34,3 +34,8 @@
 # Github
 .github/CODEOWNERS
 .github/FUNDING
+
+# Local backups
+BACKUP/
+*.bak
+

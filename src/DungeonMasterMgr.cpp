@@ -6,6 +6,7 @@
 #include "DungeonMasterMgr.h"
 #include "DMBossSpawnQuery.h"
 #include "RoguelikeMgr.h"
+#include "botmgr.h"
 #include "DMConfig.h"
 #include "Player.h"
 #include "Group.h"
@@ -13,6 +14,7 @@
 #include "CreatureAI.h"
 #include "Map.h"
 #include "MapMgr.h"
+#include "DisableMgr.h"
 #include "GameObject.h"
 #include "ObjectMgr.h"
 #include "WorldSession.h"
@@ -246,6 +248,17 @@ DungeonMasterMgr* DungeonMasterMgr::Instance()
 void DungeonMasterMgr::Initialize()
 {
     LOG_INFO("module", "DungeonMaster: Initializing...");
+    CharacterDatabase.Execute(
+        "CREATE TABLE IF NOT EXISTS `dm_player_return_position` ("
+        "`guid` bigint(20) unsigned NOT NULL,"
+        "`map_id` int(10) unsigned NOT NULL,"
+        "`position_x` float NOT NULL,"
+        "`position_y` float NOT NULL,"
+        "`position_z` float NOT NULL,"
+        "`orientation` float NOT NULL,"
+        "PRIMARY KEY (`guid`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
+    );
     LoadFromDB();
     LOG_INFO("module", "DungeonMaster: Ready — {} creature types, {} bosses, {} dungeon bosses, {} reward items, {} loot items.",
         _creaturesByType.size(), _bossCreatures.size(), _dungeonBossPool.size(), _rewardItems.size(), _lootPool.size());
@@ -259,6 +272,7 @@ void DungeonMasterMgr::LoadFromDB()
     LoadRewardItems();
     LoadLootPool();
     LoadAllPlayerStats();
+    LoadDungeonSpawnCounts();
 }
 
 // Load creature pools from world DB, split into trash (rank 0) and boss (rank 1/2/4)
@@ -394,7 +408,7 @@ void DungeonMasterMgr::LoadDungeonBossPool()
         "JOIN creature c ON c.id1 = ct.entry "
         "LEFT JOIN creature_template_movement ctm ON ct.entry = ctm.CreatureId "
         "WHERE c.map IN (%s) "
-        "AND ct.`rank` IN (1, 2) "
+        "AND ct.`rank` IN (1, 2, 3) "
         "AND ct.ScriptName != '' "
         "AND ct.type > 0 AND ct.type <= 10 "
         "AND ct.minlevel > 0 "
@@ -427,6 +441,15 @@ void DungeonMasterMgr::LoadDungeonBossPool()
         e.Type     = f[2].Get<uint32>();
         e.MinLevel = f[3].Get<uint8>();
         e.MaxLevel = f[4].Get<uint8>();
+
+        // Strip CREATURE_TYPE_FLAG_BOSS_MOB (0x4) from bosses so they don't display as skull level
+        const CreatureTemplate* cInfo = sObjectMgr->GetCreatureTemplate(e.Entry);
+        if (cInfo && (cInfo->type_flags & 0x4))
+        {
+            const_cast<CreatureTemplate*>(cInfo)->type_flags &= ~0x4;
+            LOG_INFO("module", "DungeonMaster: Patched in-memory template for boss creature '{}' (entry {}) to strip CREATURE_TYPE_FLAG_BOSS_MOB flag.",
+                cInfo->Name, e.Entry);
+        }
 
         _dungeonBossPool[e.Type].push_back(e);
         ++count;
@@ -501,6 +524,34 @@ const ClassLevelStatEntry* DungeonMasterMgr::GetBaseStatsForLevel(
     return nullptr;
 }
 
+static uint8 EstimateRequiredLevel(uint16 itemLevel, uint8 quality)
+{
+    if (itemLevel >= 200)
+    {
+        return 80;
+    }
+    else if (itemLevel >= 130) // WotLK leveling range (70-80)
+    {
+        uint8 estimated = 70 + static_cast<uint8>((itemLevel - 130) / 7);
+        return std::min<uint8>(80, std::max<uint8>(70, estimated));
+    }
+    else if (itemLevel >= 80) // TBC leveling range (58-70)
+    {
+        uint8 estimated = 58 + static_cast<uint8>((itemLevel - 80) / 4);
+        return std::min<uint8>(70, std::max<uint8>(58, estimated));
+    }
+    else // Classic leveling range (1-60)
+    {
+        if (quality == 4 && itemLevel >= 60)
+        {
+            return 60;
+        }
+        int32 estimated = static_cast<int32>(itemLevel) - 5;
+        if (estimated < 1) estimated = 1;
+        return std::min<uint8>(60, static_cast<uint8>(estimated));
+    }
+}
+
 // Cache equippable reward items (green/blue/purple)
 void DungeonMasterMgr::LoadRewardItems()
 {
@@ -511,19 +562,23 @@ void DungeonMasterMgr::LoadRewardItems()
         "AllowableClass, ItemLevel "
         "FROM item_template "
         "WHERE Quality >= 2 AND Quality <= 4 "
-        "AND RequiredLevel > 0 AND RequiredLevel <= 80 "
+        "AND RequiredLevel <= 80 "
         "AND InventoryType > 0 AND InventoryType <= 26 "
         "AND InventoryType NOT IN (18, 19, 24) "
         "AND class IN (2, 4) AND (Flags & 0x8) = 0 "
+        "AND (Flags & 0x10) = 0 "
         "AND AllowableClass != 0 "
         "AND RequiredReputationFaction = 0 "
         "AND RequiredHonorRank = 0 "
+        "AND displayid > 0 "
+        "AND name != '' "
         "AND name NOT LIKE '%Test%' "
         "AND name NOT LIKE '%Deprecated%' "
         "AND name NOT LIKE '%[PH]%' "
         "AND name NOT LIKE '%OLD%' "
         "AND name NOT LIKE '%Monster -%' "
         "AND name NOT LIKE '%zzOLD%' "
+        "AND name NOT LIKE '%Debug%' "
         "ORDER BY RequiredLevel, Quality");
 
     if (result)
@@ -534,13 +589,19 @@ void DungeonMasterMgr::LoadRewardItems()
             RewardItem ri;
             ri.Entry         = f[0].Get<uint32>();
             ri.MinLevel      = f[1].Get<uint8>();
-            ri.MaxLevel      = ri.MinLevel + 5;
             ri.Quality       = f[2].Get<uint8>();
             ri.InventoryType = f[3].Get<uint32>();
             ri.Class         = f[4].Get<uint32>();
             ri.SubClass      = f[5].Get<uint32>();
             ri.AllowableClass = f[6].Get<int32>();
             ri.ItemLevel     = f[7].Get<uint16>();
+
+            if (ri.MinLevel == 0)
+            {
+                ri.MinLevel = EstimateRequiredLevel(ri.ItemLevel, ri.Quality);
+            }
+            ri.MaxLevel      = ri.MinLevel + 5;
+
             _rewardItems.push_back(ri);
         } while (result->NextRow());
     }
@@ -633,16 +694,16 @@ uint8 DungeonMasterMgr::ComputeEffectiveLevel(Player* leader) const
 // SESSION LIFECYCLE
 
 Session* DungeonMasterMgr::CreateSession(Player* leader, uint32 difficultyId,
-                                          uint32 themeId, uint32 mapId,
+                                          uint32 themeId, uint32 dungeonIndex,
                                           bool scaleToParty)
 {
     const DifficultyTier* diff  = sDMConfig->GetDifficulty(difficultyId);
     const Theme*          theme = sDMConfig->GetTheme(themeId);
-    const DungeonInfo*    dg    = sDMConfig->GetDungeon(mapId);
+    const DungeonInfo*    dg    = sDMConfig->GetDungeon(dungeonIndex);
     if (!diff || !theme || !dg)
         return nullptr;
 
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
 
     // Check capacity under the lock to avoid race conditions
     if (!CanCreateNewSession())
@@ -654,7 +715,8 @@ Session* DungeonMasterMgr::CreateSession(Player* leader, uint32 difficultyId,
     s.State        = SessionState::Preparing;
     s.DifficultyId = difficultyId;
     s.ThemeId      = themeId;
-    s.MapId        = mapId;
+    s.MapId        = dg->MapId;
+    s.DungeonIndex = dungeonIndex;
     s.ScaleToParty = scaleToParty;
     s.StartTime    = GameTime::GetGameTime().count();
 
@@ -717,7 +779,16 @@ Session* DungeonMasterMgr::CreateSession(Player* leader, uint32 difficultyId,
 
     _activeSessions[s.SessionId] = s;
     for (const auto& pd : s.Players)
+    {
         _playerToSession[pd.PlayerGuid] = s.SessionId;
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "REPLACE INTO `dm_player_return_position` (`guid`, `map_id`, `position_x`, `position_y`, `position_z`, `orientation`) "
+            "VALUES (%u, %u, %f, %f, %f, %f)",
+            pd.PlayerGuid.GetCounter(), pd.ReturnMapId, pd.ReturnPosition.GetPositionX(), pd.ReturnPosition.GetPositionY(), pd.ReturnPosition.GetPositionZ(), pd.ReturnPosition.GetOrientation());
+        CharacterDatabase.Execute(query);
+    }
 
     LOG_INFO("module", "DungeonMaster: Session {} — leader {}, party {}, diff {}, level band {}-{}, scale={}",
         s.SessionId, leader->GetName(), s.Players.size(),
@@ -728,14 +799,14 @@ Session* DungeonMasterMgr::CreateSession(Player* leader, uint32 difficultyId,
 
 Session* DungeonMasterMgr::GetSession(uint32 id)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto it = _activeSessions.find(id);
     return it != _activeSessions.end() ? &it->second : nullptr;
 }
 
 Session* DungeonMasterMgr::GetSessionByInstance(uint32 instId)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto it = _instanceToSession.find(instId);
     if (it != _instanceToSession.end())
     {
@@ -747,7 +818,7 @@ Session* DungeonMasterMgr::GetSessionByInstance(uint32 instId)
 
 Session* DungeonMasterMgr::GetSessionByPlayer(ObjectGuid guid)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto it = _playerToSession.find(guid);
     if (it != _playerToSession.end())
     {
@@ -763,7 +834,27 @@ bool DungeonMasterMgr::StartDungeon(Session* session)
 {
     if (!session) return false;
 
-    session->EntrancePos = GetDungeonEntrance(session->MapId);
+    // Phase 1: Increment runs_started in bestiary meta
+    if (sDMConfig->IsBestiaryEnabled())
+    {
+        for (const auto& pd : session->Players)
+        {
+            uint32 guidLow = pd.PlayerGuid.GetCounter();
+            IncrementBestiaryMetaRunsStarted(guidLow, session->MapId);
+            SavePlayerDungeonData(guidLow);
+        }
+    }
+
+    const DungeonInfo* dg = sDMConfig->GetDungeon(session->DungeonIndex);
+    if (dg)
+    {
+        session->EntrancePos = dg->EntrancePos;
+    }
+    else
+    {
+        session->EntrancePos = GetDungeonEntrance(session->MapId);
+    }
+
     if (session->EntrancePos.GetPositionX() == 0 &&
         session->EntrancePos.GetPositionY() == 0 &&
         session->EntrancePos.GetPositionZ() == 0)
@@ -777,7 +868,7 @@ bool DungeonMasterMgr::StartDungeon(Session* session)
 bool DungeonMasterMgr::TeleportPartyIn(Session* session)
 {
     if (!session) return false;
-    const DungeonInfo* dg = sDMConfig->GetDungeon(session->MapId);
+    const DungeonInfo* dg = sDMConfig->GetDungeon(session->DungeonIndex);
     if (!dg) return false;
 
     Position ent = session->EntrancePos;
@@ -801,7 +892,7 @@ bool DungeonMasterMgr::TeleportPartyIn(Session* session)
         }
 
         if (p->TeleportTo(session->MapId, ent.GetPositionX(), ent.GetPositionY(),
-                          ent.GetPositionZ(), ent.GetOrientation()))
+                          ent.GetPositionZ(), ent.GetOrientation(), TELE_TO_GM_MODE))
         {
             ++ok;
             LOG_INFO("module", "DungeonMaster: TeleportTo queued for {} → map {} ({:.1f}, {:.1f}, {:.1f})",
@@ -826,16 +917,169 @@ bool DungeonMasterMgr::TeleportPartyIn(Session* session)
         {
             LOG_ERROR("module", "DungeonMaster: TeleportTo FAILED for {} → map {} ({:.1f}, {:.1f}, {:.1f})",
                 p->GetName(), session->MapId, ent.GetPositionX(), ent.GetPositionY(), ent.GetPositionZ());
-            ChatHandler(p->GetSession()).SendSysMessage(
-                "|cFFFF0000[Dungeon Master]|r Teleport failed! You may lack access to this dungeon.");
+
+            Map::EnterState denyReason = sMapMgr->PlayerCannotEnter(session->MapId, p, false);
+            std::string reasonStr = "Unknown internal error";
+            switch (denyReason)
+            {
+                case Map::CAN_ENTER:
+                    reasonStr = "Teleport failed (check coordinates/maps/flight/taxi/vehicle status).";
+                    break;
+                case Map::CANNOT_ENTER_ALREADY_IN_MAP:
+                    reasonStr = "You are already in this map.";
+                    break;
+                case Map::CANNOT_ENTER_NO_ENTRY:
+                    reasonStr = "No map entry was found for the target map ID.";
+                    break;
+                case Map::CANNOT_ENTER_UNINSTANCED_DUNGEON:
+                    reasonStr = "No instance template was found for this dungeon.";
+                    break;
+                case Map::CANNOT_ENTER_DIFFICULTY_UNAVAILABLE:
+                    reasonStr = "Requested difficulty is not available for this map.";
+                    break;
+                case Map::CANNOT_ENTER_NOT_IN_RAID:
+                    reasonStr = "You must be in a raid group to enter this dungeon.";
+                    break;
+                case Map::CANNOT_ENTER_CORPSE_IN_DIFFERENT_INSTANCE:
+                    reasonStr = "You are dead and your corpse is in a different instance.";
+                    break;
+                case Map::CANNOT_ENTER_INSTANCE_BIND_MISMATCH:
+                    reasonStr = "Your permanent instance save is not compatible with the group's current bind.";
+                    break;
+                case Map::CANNOT_ENTER_TOO_MANY_INSTANCES:
+                    reasonStr = "You have entered too many instances recently (instance lock).";
+                    break;
+                case Map::CANNOT_ENTER_MAX_PLAYERS:
+                    reasonStr = "The dungeon is full.";
+                    break;
+                case Map::CANNOT_ENTER_ZONE_IN_COMBAT:
+                    reasonStr = "A boss encounter is currently in progress.";
+                    break;
+                case Map::CANNOT_ENTER_UNSPECIFIED_REASON:
+                {
+                    reasonStr = "Level, key, quest, or achievement requirements not met.";
+                    MapEntry const* mapEntry = sMapStore.LookupEntry(session->MapId);
+                    if (mapEntry)
+                    {
+                        Difficulty targetDifficulty = p->GetDifficulty(mapEntry->IsRaid());
+                        GetDownscaledMapDifficultyData(mapEntry->MapID, targetDifficulty);
+
+                        if (DisableMgr::IsDisabledFor(DISABLE_TYPE_MAP, session->MapId, p))
+                        {
+                            reasonStr = "This dungeon map is disabled (closed) by server configuration.";
+                        }
+                        else if (DungeonProgressionRequirements const* ar = sObjectMgr->GetAccessRequirement(session->MapId, targetDifficulty))
+                        {
+                            reasonStr = "Requirements not met:";
+                            if (ar->levelMin && p->GetLevel() < ar->levelMin)
+                            {
+                                char lvlBuf[128];
+                                snprintf(lvlBuf, sizeof(lvlBuf), " Requires min level %u (you are %u).", ar->levelMin, p->GetLevel());
+                                reasonStr += lvlBuf;
+                            }
+                            if (ar->levelMax && p->GetLevel() > ar->levelMax)
+                            {
+                                char lvlBuf[128];
+                                snprintf(lvlBuf, sizeof(lvlBuf), " Maximum level allowed is %u (you are %u).", ar->levelMax, p->GetLevel());
+                                reasonStr += lvlBuf;
+                            }
+                            if (sWorld->getBoolConfig(CONFIG_DUNGEON_ACCESS_REQUIREMENTS_PORTAL_CHECK_ILVL) && ar->reqItemLevel && p->GetAverageItemLevelForDF() < ar->reqItemLevel)
+                            {
+                                char ilvlBuf[128];
+                                snprintf(ilvlBuf, sizeof(ilvlBuf), " Requires average Item Level %u (you have %u).", ar->reqItemLevel, (uint16)p->GetAverageItemLevelForDF());
+                                reasonStr += ilvlBuf;
+                            }
+
+                            Player* partyLeader = p;
+                            ObjectGuid leaderGuid = p->GetGroup() ? p->GetGroup()->GetLeaderGUID() : p->GetGUID();
+                            Player* tempLeader = HashMapHolder<Player>::Find(leaderGuid);
+                            if (leaderGuid != p->GetGUID() && tempLeader != nullptr)
+                            {
+                                partyLeader = tempLeader;
+                            }
+
+                            // Check items
+                            for (const ProgressionRequirement* itemReq : ar->items)
+                            {
+                                Player* checkPlayer = itemReq->checkLeaderOnly ? partyLeader : p;
+                                if (itemReq->faction == TEAM_NEUTRAL || itemReq->faction == checkPlayer->GetTeamId(true))
+                                {
+                                    if (!checkPlayer->HasItemCount(itemReq->id, 1))
+                                    {
+                                        std::string itemName = "Unknown Item";
+                                        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemReq->id))
+                                            itemName = proto->Name1;
+                                        char itemBuf[256];
+                                        snprintf(itemBuf, sizeof(itemBuf), " Requires item [%s] (ID: %u)%s.", itemName.c_str(), itemReq->id, itemReq->checkLeaderOnly ? " on group leader" : "");
+                                        reasonStr += itemBuf;
+                                    }
+                                }
+                            }
+
+                            // Check quests
+                            for (const ProgressionRequirement* questReq : ar->quests)
+                            {
+                                Player* checkPlayer = questReq->checkLeaderOnly ? partyLeader : p;
+                                if (questReq->faction == TEAM_NEUTRAL || questReq->faction == checkPlayer->GetTeamId(true))
+                                {
+                                    if (!checkPlayer->GetQuestRewardStatus(questReq->id))
+                                    {
+                                        std::string questTitle = "Unknown Quest";
+                                        if (Quest const* q = sObjectMgr->GetQuestTemplate(questReq->id))
+                                            questTitle = q->GetTitle();
+                                        char questBuf[256];
+                                        snprintf(questBuf, sizeof(questBuf), " Requires quest \"%s\" (ID: %u)%s.", questTitle.c_str(), questReq->id, questReq->checkLeaderOnly ? " on group leader" : "");
+                                        reasonStr += questBuf;
+                                    }
+                                }
+                            }
+
+                            // Check achievements
+                            for (const ProgressionRequirement* achReq : ar->achievements)
+                            {
+                                Player* checkPlayer = achReq->checkLeaderOnly ? partyLeader : p;
+                                if (achReq->faction == TEAM_NEUTRAL || achReq->faction == checkPlayer->GetTeamId(true))
+                                {
+                                    if (!checkPlayer->HasAchieved(achReq->id))
+                                    {
+                                        std::string achTitle = "Unknown Achievement";
+                                        if (AchievementEntry const* ach = sAchievementStore.LookupEntry(achReq->id))
+                                            achTitle = ach->name[p->GetSession()->GetSessionDbcLocale()];
+                                        char achBuf[256];
+                                        snprintf(achBuf, sizeof(achBuf), " Requires achievement \"%s\" (ID: %u)%s.", achTitle.c_str(), achReq->id, achReq->checkLeaderOnly ? " on group leader" : "");
+                                        reasonStr += achBuf;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            reasonStr = "No level/quest requirements in database, but entry check returned false.";
+                        }
+                    }
+                    break;
+                }
+            }
+            char buf[512];
+            snprintf(buf, sizeof(buf), "|cFFFF0000[Dungeon Master]|r Teleport failed: %s", reasonStr.c_str());
+            ChatHandler(p->GetSession()).SendSysMessage(buf);
         }
     }
 
     if (ok > 0)
     {
-        session->State = SessionState::InProgress;
+        if (session->RoguelikeRunId != 0)
+        {
+            session->State = SessionState::Preparing;
+            session->PreparationTimer = 30;
+        }
+        else
+        {
+            session->State = SessionState::InProgress;
+        }
         // InstanceId is set when a player actually arrives on the map
         // (via the allmap script or the Update tick populate logic).
+        SendSessionUpdateToPlayers(session);
         return true;
     }
     return false;
@@ -873,7 +1117,7 @@ Position DungeonMasterMgr::GetDungeonEntrance(uint32 mapId)
 }
 
 // Spawn-point collection
-std::vector<SpawnPoint> DungeonMasterMgr::GetSpawnPointsForMap(uint32 mapId)
+std::vector<SpawnPoint> DungeonMasterMgr::GetSpawnPointsForMap(uint32 mapId, uint32 dungeonIndex)
 {
     std::vector<SpawnPoint> pts;
 
@@ -884,7 +1128,8 @@ std::vector<SpawnPoint> DungeonMasterMgr::GetSpawnPointsForMap(uint32 mapId)
     QueryResult result = WorldDatabase.Query(q);
     if (!result) return pts;
 
-    Position ent = GetDungeonEntrance(mapId);
+    const DungeonInfo* dg = sDMConfig->GetDungeon(dungeonIndex);
+    Position ent = dg ? dg->EntrancePos : GetDungeonEntrance(mapId);
     float ex = ent.GetPositionX(), ey = ent.GetPositionY(), ez = ent.GetPositionZ();
 
     do
@@ -893,10 +1138,14 @@ std::vector<SpawnPoint> DungeonMasterMgr::GetSpawnPointsForMap(uint32 mapId)
         float x = f[0].Get<float>(), y = f[1].Get<float>(),
               z = f[2].Get<float>(), o = f[3].Get<float>();
 
+        float dx = x - ex, dy = y - ey, dz = z - ez;
+        float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if ((mapId == 189 || mapId == 329 || mapId == 429) && dist > 500.0f)
+            continue;
+
         SpawnPoint sp;
         sp.Pos.Relocate(x, y, z, o);
-        float dx = x - ex, dy = y - ey, dz = z - ez;
-        sp.DistanceFromEntrance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        sp.DistanceFromEntrance = dist;
         pts.push_back(sp);
     } while (result->NextRow());
 
@@ -935,6 +1184,10 @@ std::vector<SpawnPoint> DungeonMasterMgr::GetSpawnPointsForMap(uint32 mapId)
 
             float dx = bc.x - ex, dy = bc.y - ey, dz = bc.z - ez;
             bc.dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+            if ((mapId == 189 || mapId == 329 || mapId == 429) && bc.dist > 500.0f)
+                continue;
+
             bosses.push_back(bc);
         } while (bossResult->NextRow());
 
@@ -1094,6 +1347,9 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
 {
     if (!session || !map) return;
 
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
+    _instanceToSession[map->GetInstanceId()] = session->SessionId;
+
     LOG_INFO("module", "DungeonMaster: PopulateDungeon ENTRY — session {} map {} instId {} mobs {} bosses {}",
         session->SessionId, session->MapId, map->GetInstanceId(),
         session->TotalMobs, session->TotalBosses);
@@ -1126,6 +1382,15 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         if (bossesNeutralized > 0)
             LOG_INFO("module", "DungeonMaster: Neutralized {} InstanceScript boss encounter(s) in map {}",
                 bossesNeutralized, map->GetId());
+
+        // Force-set custom event states for Shadowfang Keep (Map ID 33)
+        if (map->GetId() == 33)
+        {
+            script->SetData(0, DONE); // TYPE_COURTYARD = DONE
+            script->SetData(1, DONE); // TYPE_FENRUS_THE_DEVOURER = DONE
+            script->SetData(2, DONE); // TYPE_WOLF_MASTER_NANDOS = DONE
+            LOG_INFO("module", "DungeonMaster: Force-set SFK custom door event states to DONE.");
+        }
     }
 
     // Purge lingering debuffs from despawned creatures
@@ -1152,7 +1417,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
                 toRemove.size(), p->GetName());
     }
 
-    session->SpawnPoints = GetSpawnPointsForMap(session->MapId);
+    session->SpawnPoints = GetSpawnPointsForMap(session->MapId, session->DungeonIndex);
     if (session->SpawnPoints.empty())
     {
         LOG_ERROR("module", "DungeonMaster: No spawn points for map {}", session->MapId);
@@ -1186,57 +1451,113 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
             bossOnlyDmgMult *= sRoguelikeMgr->GetTierDamageMultiplier(session->RoguelikeRunId);
     }
 
-    auto applyLevelAndStats = [&](Creature* c, float extraHpMult, float extraDmgMult, bool isBoss)
+    auto applyLevelAndStats = [&](Creature* c, float extraHpMult, float extraDmgMult, bool isBoss, bool isElite)
     {
-    
         c->SetLevel(targetLevel);
 
-    
-        if (isBoss)
+        // Strip CREATURE_TYPE_FLAG_BOSS_MOB (0x4) from creature template to avoid skull level math
+        const CreatureTemplate* cInfo = c->GetCreatureTemplate();
+        if (cInfo && (cInfo->type_flags & 0x4))
         {
-            c->SetByteValue(UNIT_FIELD_BYTES_0, 2, 1);  // Elite rank → gold dragon frame
-            c->SetObjectScale(1.3f);                      // 30% larger than normal
+            const_cast<CreatureTemplate*>(cInfo)->type_flags &= ~0x4;
+            LOG_INFO("module", "DungeonMaster: Patched in-memory template for creature '{}' (entry {}) to strip CREATURE_TYPE_FLAG_BOSS_MOB flag.",
+                cInfo->Name, c->GetEntry());
         }
 
-        uint8 unitClass = c->GetCreatureTemplate()->unit_class;
+        // Set proper rank dynamically: boss/elite = 1, rare = 4, normal = 0
+        uint8 rank = 0;
+        if (isBoss)
+        {
+            rank = 1; // elite frame for bosses (with 1.3x scale)
+            c->SetObjectScale(1.3f);
+        }
+        else if (c->GetByteValue(UNIT_FIELD_BYTES_0, 2) == 4)
+        {
+            rank = 4; // keep rare frame
+            c->SetObjectScale(1.15f);
+        }
+        else if (isElite)
+        {
+            rank = 1; // elite frame for elite trash
+            c->SetObjectScale(1.0f);
+        }
+        else
+        {
+            rank = 0; // normal frame for normal trash
+            c->SetObjectScale(1.0f);
+        }
+        c->SetByteValue(UNIT_FIELD_BYTES_0, 2, rank);
+
+        uint8 unitClass = cInfo ? cInfo->unit_class : 1;
         const ClassLevelStatEntry* baseStats = GetBaseStatsForLevel(unitClass, targetLevel);
 
-    
-        float finalHP;
+        float finalHP = 0.0f;
+        float baseArmor = 0.0f;
+        float dmgBase = 0.0f;
+        float apBonus = 0.0f;
+
         if (baseStats)
-            finalHP = static_cast<float>(baseStats->BaseHP) * hpMult * extraHpMult;
+        {
+            finalHP = static_cast<float>(baseStats->BaseHP) * hpMult * extraHpMult * sDMConfig->GetBaseHealthMult();
+            baseArmor = static_cast<float>(baseStats->BaseArmor);
+            dmgBase = baseStats->BaseDamage;
+            apBonus = static_cast<float>(baseStats->AttackPower) / 14.0f;
+        }
         else
-            finalHP = c->GetMaxHealth() * hpMult * extraHpMult;
+        {
+            float synthHP = 100.0f + targetLevel * 15.0f + targetLevel * targetLevel * 1.5f + targetLevel * targetLevel * targetLevel * 0.01f;
+            finalHP = synthHP * hpMult * extraHpMult * sDMConfig->GetBaseHealthMult();
+            baseArmor = targetLevel * targetLevel * 0.5f + targetLevel * 10.0f;
+            dmgBase = 5.0f + targetLevel * 0.8f;
+            apBonus = (targetLevel * 4.0f) / 14.0f;
+        }
 
         uint32 hp = std::max(1u, static_cast<uint32>(finalHP));
+
+        // Reset flat modifiers first so derived calculations use correct values
+        c->SetStatFlatModifier(UNIT_MOD_HEALTH, BASE_VALUE, (float)hp);
+
+        uint32 mana = 0;
+        if (cInfo)
+        {
+            if (CreatureBaseStats const* cStats = sObjectMgr->GetCreatureBaseStats(targetLevel, cInfo->unit_class))
+            {
+                mana = cStats->GenerateMana(cInfo);
+                c->SetStatFlatModifier(UNIT_MOD_ATTACK_POWER, BASE_VALUE, static_cast<float>(cStats->AttackPower));
+                c->SetStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, BASE_VALUE, static_cast<float>(cStats->RangedAttackPower));
+            }
+        }
+        c->SetStatFlatModifier(UNIT_MOD_MANA, BASE_VALUE, (float)mana);
+        c->SetCreateMana(mana);
+        c->SetMaxPower(POWER_MANA, mana);
+        c->SetPower(POWER_MANA, mana);
+
+        // Reset HP first to avoid scaling/percentage bugs
+        c->SetMaxHealth(1);
+        c->SetHealth(1);
         c->SetMaxHealth(hp);
         c->SetHealth(hp);
 
         // For bosses, use party-only scaling (bossOnlyDmgMult) instead of the full
         // tier+party dmgMult to prevent double-stacking tier DamageMultiplier with BossDamageMult
         float effectiveDmgMult = isBoss ? bossOnlyDmgMult : dmgMult;
+        float atkTime = static_cast<float>(cInfo ? cInfo->BaseAttackTime : 2000) / 1000.0f;
+        if (atkTime <= 0.0f) atkTime = 2.0f;
 
-        if (baseStats)
-        {
-            float dmgBase  = baseStats->BaseDamage;
-            float apBonus  = static_cast<float>(baseStats->AttackPower) / 14.0f;
-            float atkTime  = static_cast<float>(c->GetCreatureTemplate()->BaseAttackTime) / 1000.0f;
-            if (atkTime <= 0.0f) atkTime = 2.0f;
+        float minDmg = (dmgBase + apBonus) * atkTime * effectiveDmgMult * extraDmgMult;
+        float maxDmg = ((dmgBase * 1.15f) + apBonus) * atkTime * effectiveDmgMult * extraDmgMult;
 
-            float minDmg = (dmgBase + apBonus) * atkTime * effectiveDmgMult * extraDmgMult;
-            float maxDmg = ((dmgBase * 1.15f) + apBonus) * atkTime * effectiveDmgMult * extraDmgMult;
+        // Normalize weapon damage to account for the core's native template DamageModifier multiplier
+        float dmgMod = (cInfo && cInfo->DamageModifier > 0.0f) ? cInfo->DamageModifier : 1.0f;
+        minDmg = std::max(1.0f, minDmg / dmgMod);
+        maxDmg = std::max(minDmg, maxDmg / dmgMod);
 
-            minDmg = std::max(1.0f, minDmg);
-            maxDmg = std::max(minDmg, maxDmg);
+        c->SetBaseWeaponDamage(BASE_ATTACK, MINDAMAGE, minDmg);
+        c->SetBaseWeaponDamage(BASE_ATTACK, MAXDAMAGE, maxDmg);
+        c->UpdateDamagePhysical(BASE_ATTACK);
 
-            c->SetBaseWeaponDamage(BASE_ATTACK, MINDAMAGE, minDmg);
-            c->SetBaseWeaponDamage(BASE_ATTACK, MAXDAMAGE, maxDmg);
-            c->UpdateDamagePhysical(BASE_ATTACK);
-        }
-
-        // --- Armor (from classlevelstats for the TARGET level) ---
-        if (baseStats && baseStats->BaseArmor > 0)
-            c->SetArmor(baseStats->BaseArmor);
+        if (baseArmor > 0.0f)
+            c->SetArmor(static_cast<uint32>(baseArmor));
 
         // --- Roguelike: additional armor scaling from tier progression ---
         if (session->RoguelikeRunId != 0)
@@ -1273,9 +1594,6 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         }
 
         // --- Install custom AI ---
-        // All spawned creatures (trash and bosses alike) use DungeonMasterCreatureAI,
-        // which handles aggro scanning, patrol movement, and death hooks.
-        // Bosses rely on auto-attack only — no scripted spell rotations.
         c->SetAI(new DungeonMasterCreatureAI(c, isBoss));
 
         // Force visibility refresh or client won't see the creature
@@ -1283,6 +1601,9 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
 
         // Track this GUID for future cleanup
         guidList.push_back(c->GetGUID());
+
+        LOG_INFO("module", "DungeonMaster: applyLevelAndStats on '{}' (entry {}, level {}): hp={}, dmg={:.1f}-{:.1f}, armor={}, rank={}",
+            cInfo ? cInfo->Name : "Unknown", c->GetEntry(), c->GetLevel(), hp, minDmg, maxDmg, c->GetArmor(), rank);
     };
 
     // Spawn trash mobs
@@ -1291,7 +1612,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
     {
         if (sp.IsBossPosition) continue;
 
-        uint32 entry = SelectCreatureForTheme(theme, false, targetLevel);
+        uint32 entry = SelectCreatureForTheme(theme, false, bandMin, bandMax);
         if (!entry) continue;
 
         Creature* c = map->SummonCreature(entry, sp.Pos);
@@ -1329,7 +1650,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         float eliteHpMult  = isElite ? sDMConfig->GetEliteHealthMult() : 1.0f;
         float eliteDmgMult = isElite ? 1.5f : 1.0f;
 
-        applyLevelAndStats(c, eliteHpMult * affixHpMult, eliteDmgMult * affixDmgMult, false);
+        applyLevelAndStats(c, eliteHpMult * affixHpMult, eliteDmgMult * affixDmgMult, false, isElite);
 
         SpawnedCreature sc;
         sc.Guid = c->GetGUID(); sc.Entry = entry;
@@ -1357,7 +1678,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
             size_t pickIdx  = validRarePoints[RandInt<size_t>(startIdx, endIdx)];
             SpawnPoint& rareSP = session->SpawnPoints[pickIdx];
 
-            uint32 rareEntry = SelectCreatureForTheme(theme, true, targetLevel);
+            uint32 rareEntry = SelectCreatureForTheme(theme, true, bandMin, bandMax);
             if (rareEntry)
             {
                 Creature* r = map->SummonCreature(rareEntry, rareSP.Pos);
@@ -1388,7 +1709,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
                         sRoguelikeMgr->GetAffixMultipliers(session->RoguelikeRunId,
                             false, true, affixHpM, affixDmgM, affixEliteM);
 
-                    applyLevelAndStats(r, rareHpMult * affixHpM, rareDmgMult * affixDmgM, false);
+                    applyLevelAndStats(r, rareHpMult * affixHpM, rareDmgMult * affixDmgM, false, true);
 
                     // Install custom AI (rare is treated as enhanced trash, not a scripted boss)
                     r->SetAI(new DungeonMasterCreatureAI(r));
@@ -1419,7 +1740,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
         if (!sp.IsBossPosition || bossesSpawned >= sDMConfig->GetBossCount())
             continue;
 
-        uint32 entry = SelectDungeonBoss(theme, targetLevel);
+        uint32 entry = SelectDungeonBoss(theme, bandMin, bandMax);
         if (!entry) { LOG_WARN("module", "DungeonMaster: No boss candidate."); continue; }
 
         Creature* b = map->SummonCreature(entry, sp.Pos);
@@ -1445,7 +1766,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
 
         applyLevelAndStats(b,
             sDMConfig->GetBossHealthMult() * bossAffixHpMult,
-            sDMConfig->GetBossDamageMult() * bossAffixDmgMult, true);
+            sDMConfig->GetBossDamageMult() * bossAffixDmgMult, true, true);
 
         SpawnedCreature sc;
         sc.Guid = b->GetGUID(); sc.Entry = entry;
@@ -1527,7 +1848,7 @@ void DungeonMasterMgr::PopulateDungeon(Session* session, InstanceMap* map)
 }
 
 // Select a creature matching the theme
-uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 targetLevel)
+uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss, uint8 bandMin, uint8 bandMax)
 {
     if (!theme) return 0;
 
@@ -1544,15 +1865,7 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
         return anyType || types.count(cType);
     };
 
-    auto levelMatch = [&](const CreaturePoolEntry& e) -> bool
-    {
-        if (targetLevel == 0)
-            return true;
-        // Allow a level band: e.g. MinLevel is at most targetLevel + 5, and MaxLevel is at least targetLevel - 10
-        return (e.MinLevel <= targetLevel + 5) && (e.MaxLevel >= targetLevel - 10);
-    };
-
-    std::vector<uint32> candidates;
+    std::vector<CreaturePoolEntry> candidates;
 
     if (isBoss)
     {
@@ -1561,21 +1874,7 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
         {
             if (!typeMatch(type)) continue;
             for (const auto& e : vec)
-            {
-                if (levelMatch(e))
-                    candidates.push_back(e.Entry);
-            }
-        }
-
-        // Try themed elites without level filter if no candidates matched the level range
-        if (candidates.empty() && targetLevel != 0)
-        {
-            for (const auto& [type, vec] : _bossCreatures)
-            {
-                if (!typeMatch(type)) continue;
-                for (const auto& e : vec)
-                    candidates.push_back(e.Entry);
-            }
+                candidates.push_back(e);
         }
 
         // --- Fallback: promote themed trash to boss (stats will be scaled up) ---
@@ -1585,19 +1884,7 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
             {
                 if (!typeMatch(type)) continue;
                 for (const auto& e : vec)
-                {
-                    if (levelMatch(e))
-                        candidates.push_back(e.Entry);
-                }
-            }
-            if (candidates.empty() && targetLevel != 0)
-            {
-                for (const auto& [type, vec] : _creaturesByType)
-                {
-                    if (!typeMatch(type)) continue;
-                    for (const auto& e : vec)
-                        candidates.push_back(e.Entry);
-                }
+                    candidates.push_back(e);
             }
         }
     }
@@ -1608,19 +1895,7 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
         {
             if (!typeMatch(type)) continue;
             for (const auto& e : vec)
-            {
-                if (levelMatch(e))
-                    candidates.push_back(e.Entry);
-            }
-        }
-        if (candidates.empty() && targetLevel != 0)
-        {
-            for (const auto& [type, vec] : _creaturesByType)
-            {
-                if (!typeMatch(type)) continue;
-                for (const auto& e : vec)
-                    candidates.push_back(e.Entry);
-            }
+                candidates.push_back(e);
         }
     }
 
@@ -1633,45 +1908,41 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
         if (isBoss)
         {
             for (const auto& [type, vec] : _bossCreatures)
-            {
                 for (const auto& e : vec)
-                {
-                    if (levelMatch(e))
-                        candidates.push_back(e.Entry);
-                }
-            }
-            if (candidates.empty() && targetLevel != 0)
-            {
-                for (const auto& [type, vec] : _bossCreatures)
-                    for (const auto& e : vec)
-                        candidates.push_back(e.Entry);
-            }
+                    candidates.push_back(e);
         }
 
         if (candidates.empty())
         {
             for (const auto& [type, vec] : _creaturesByType)
-            {
                 for (const auto& e : vec)
-                {
-                    if (levelMatch(e))
-                        candidates.push_back(e.Entry);
-                }
-            }
-            if (candidates.empty() && targetLevel != 0)
-            {
-                for (const auto& [type, vec] : _creaturesByType)
-                    for (const auto& e : vec)
-                        candidates.push_back(e.Entry);
-            }
+                    candidates.push_back(e);
         }
     }
 
+    // Now filter candidates by level band [bandMin, bandMax]
+    std::vector<uint32> filtered;
+    for (const auto& e : candidates)
+    {
+        if (e.MaxLevel >= bandMin && e.MinLevel <= bandMax)
+        {
+            filtered.push_back(e.Entry);
+        }
+    }
+
+    if (!filtered.empty())
+    {
+        LOG_DEBUG("module", "DungeonMaster: {} level-matching candidates for theme '{}' (boss={}, band {}-{})",
+            filtered.size(), theme->Name, isBoss, bandMin, bandMax);
+        return filtered[RandInt<size_t>(0, filtered.size() - 1)];
+    }
+
+    // If no exact level-matching candidates, fall back to any level candidate
     if (!candidates.empty())
     {
-        LOG_DEBUG("module", "DungeonMaster: {} candidates for theme '{}' (boss={})",
-            candidates.size(), theme->Name, isBoss);
-        return candidates[RandInt<size_t>(0, candidates.size() - 1)];
+        LOG_WARN("module", "DungeonMaster: No level-matching creatures for theme '{}' (band {}-{}) — using fallback.",
+            theme->Name, bandMin, bandMax);
+        return candidates[RandInt<size_t>(0, candidates.size() - 1)].Entry;
     }
 
     LOG_ERROR("module", "DungeonMaster: ZERO candidates for theme '{}' (boss={})",
@@ -1679,8 +1950,7 @@ uint32 DungeonMasterMgr::SelectCreatureForTheme(const Theme* theme, bool isBoss,
     return 0;
 }
 
-
-uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 targetLevel)
+uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 bandMin, uint8 bandMax)
 {
     if (!theme) return 0;
 
@@ -1697,32 +1967,13 @@ uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 targetLevel
         return anyType || types.count(cType);
     };
 
-    auto levelMatch = [&](const CreaturePoolEntry& e) -> bool
-    {
-        if (targetLevel == 0)
-            return true;
-        return (e.MinLevel <= targetLevel + 5) && (e.MaxLevel >= targetLevel - 10);
-    };
-
     // Prefer themed dungeon bosses
-    std::vector<uint32> candidates;
+    std::vector<CreaturePoolEntry> candidates;
     for (const auto& [type, vec] : _dungeonBossPool)
     {
         if (!typeMatch(type)) continue;
         for (const auto& e : vec)
-        {
-            if (levelMatch(e))
-                candidates.push_back(e.Entry);
-        }
-    }
-    if (candidates.empty() && targetLevel != 0)
-    {
-        for (const auto& [type, vec] : _dungeonBossPool)
-        {
-            if (!typeMatch(type)) continue;
-            for (const auto& e : vec)
-                candidates.push_back(e.Entry);
-        }
+            candidates.push_back(e);
     }
 
     // Fallback: any dungeon boss
@@ -1731,32 +1982,43 @@ uint32 DungeonMasterMgr::SelectDungeonBoss(const Theme* theme, uint8 targetLevel
         LOG_DEBUG("module", "DungeonMaster: No themed dungeon boss for '{}' — using any dungeon boss.",
             theme->Name);
         for (const auto& [type, vec] : _dungeonBossPool)
-        {
             for (const auto& e : vec)
-            {
-                if (levelMatch(e))
-                    candidates.push_back(e.Entry);
-            }
-        }
-        if (candidates.empty() && targetLevel != 0)
-        {
-            for (const auto& [type, vec] : _dungeonBossPool)
-                for (const auto& e : vec)
-                    candidates.push_back(e.Entry);
-        }
+                candidates.push_back(e);
+    }
+
+    // Filter by level band
+    std::vector<uint32> filtered;
+    for (const auto& e : candidates)
+    {
+        if (e.MaxLevel >= bandMin && e.MinLevel <= bandMax)
+            filtered.push_back(e.Entry);
+    }
+
+    if (!filtered.empty())
+    {
+        uint32 entry = filtered[RandInt<size_t>(0, filtered.size() - 1)];
+        LOG_DEBUG("module", "DungeonMaster: Selected level-matching dungeon boss entry {} from {} candidates (theme '{}', band {}-{})",
+            entry, filtered.size(), theme->Name, bandMin, bandMax);
+        return entry;
+    }
+
+    // Fallback to any level dungeon boss candidate
+    if (!candidates.empty())
+    {
+        uint32 entry = candidates[RandInt<size_t>(0, candidates.size() - 1)].Entry;
+        LOG_DEBUG("module", "DungeonMaster: Selected dungeon boss entry {} from {} candidates (fallback, no level match, theme '{}')",
+            entry, candidates.size(), theme->Name);
+        return entry;
     }
 
     // Last resort: generic boss pool
     if (candidates.empty())
     {
         LOG_WARN("module", "DungeonMaster: Dungeon boss pool empty — falling back to generic boss selection.");
-        return SelectCreatureForTheme(theme, true, targetLevel);
+        return SelectCreatureForTheme(theme, true, bandMin, bandMax);
     }
 
-    uint32 entry = candidates[RandInt<size_t>(0, candidates.size() - 1)];
-    LOG_DEBUG("module", "DungeonMaster: Selected dungeon boss entry {} from {} candidates (theme '{}')",
-        entry, candidates.size(), theme->Name);
-    return entry;
+    return 0;
 }
 
 // Death handling
@@ -1793,6 +2055,19 @@ void DungeonMasterMgr::HandleCreatureDeath(Creature* creature, Session* session)
                 sc.KillCredited = true;
                 GiveKillXP(session, sc.IsBoss, sc.IsElite);
 
+                // Phase 1: Increment Bestiary and Bestiary Meta counts for all players in the session
+                if (sDMConfig->IsBestiaryEnabled())
+                {
+                    uint32 creatureType = creature->GetCreatureTemplate()->type;
+                    for (const auto& pd : session->Players)
+                    {
+                        uint32 guidLow = pd.PlayerGuid.GetCounter();
+                        IncrementBestiaryKills(guidLow, session->MapId, creatureType, 1);
+                        IncrementBestiaryMetaKills(guidLow, session->MapId, 1);
+                        SavePlayerDungeonData(guidLow);
+                    }
+                }
+
                 if (sc.IsBoss)
                 {
                     PendingPhaseCheck ppc;
@@ -1805,6 +2080,8 @@ void DungeonMasterMgr::HandleCreatureDeath(Creature* creature, Session* session)
 
                     LOG_INFO("module", "DungeonMaster: Boss '{}' died — deferring kill count for phase check",
                         creature->GetName());
+
+                    SendSessionUpdateToPlayers(session);
                 }
                 else
                 {
@@ -1823,18 +2100,55 @@ void DungeonMasterMgr::HandleCreatureDeath(Creature* creature, Session* session)
 void DungeonMasterMgr::HandleBossDeath(Session* session)
 {
     if (!session) return;
+
+    // Phase 1: Hook boss kills in HandleBossDeath() (set boss beaten/encountered)
+    if (sDMConfig->IsBestiaryEnabled())
+    {
+        for (const auto& pd : session->Players)
+        {
+            uint32 guidLow = pd.PlayerGuid.GetCounter();
+            SetBestiaryMetaBossEncountered(guidLow, session->MapId);
+            SetBestiaryMetaBossBeaten(guidLow, session->MapId);
+            SavePlayerDungeonData(guidLow);
+        }
+    }
+
+    bool finalBoss = (session->BossesKilled >= session->TotalBosses);
+
+    if (finalBoss)
+    {
+        SendRaidWarningToPlayers(session, "Boss Defeated!");
+    }
+    else
+    {
+        char warningBuf[128];
+        snprintf(warningBuf, sizeof(warningBuf), "Boss Defeated! %u remaining.", session->TotalBosses - session->BossesKilled);
+        SendRaidWarningToPlayers(session, warningBuf);
+    }
+
     for (const auto& pd : session->Players)
+    {
         if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
         {
-            if (session->BossesKilled < session->TotalBosses && p->GetSession())
+            if (p->GetSession())
             {
                 char buf[128];
-                snprintf(buf, sizeof(buf),
-                    "|cFFFFFF00[Dungeon Master]|r Boss defeated! |cFFFFFFFF%u|r remaining.",
-                    session->TotalBosses - session->BossesKilled);
+                if (finalBoss)
+                {
+                    snprintf(buf, sizeof(buf), "|cFFFFFF00[Dungeon Master]|r Final boss defeated!");
+                }
+                else
+                {
+                    snprintf(buf, sizeof(buf),
+                        "|cFFFFFF00[Dungeon Master]|r Boss defeated! |cFFFFFFFF%u|r remaining.",
+                        session->TotalBosses - session->BossesKilled);
+                }
                 ChatHandler(p->GetSession()).SendSysMessage(buf);
             }
         }
+    }
+
+    SendSessionUpdateToPlayers(session);
 }
 
     // Called from JustDied hook — fills loot before corpse is opened
@@ -1845,7 +2159,7 @@ void DungeonMasterMgr::OnCreatureDeathHook(Creature* creature)
     LOG_INFO("module", "DungeonMaster: OnCreatureDeathHook called for {} (GUID: {})",
         creature->GetName(), creature->GetGUID().GetCounter());
 
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
 
     for (auto& [sid, session] : _activeSessions)
     {
@@ -1933,7 +2247,123 @@ void DungeonMasterMgr::HandlePlayerDeath(Player* player, Session* session)
     {
         ++session->Wipes;
 
-        // --- Roguelike: delegate wipe handling to RoguelikeMgr ---
+        if (session->RoguelikeRunId != 0)
+        {
+            if (RoguelikeRun* run = sRoguelikeMgr->GetRunBySession(session->SessionId))
+            {
+                run->Wipes = session->Wipes;
+            }
+        }
+
+        // --- Check if lives/wipes remaining ---
+        uint32 maxWipes = sDMConfig->GetMaxWipes();
+        if (session->LeaderGuid && sDungeonMasterMgr->HasMasteryPerk(session->LeaderGuid.GetCounter(), 4))
+        {
+            maxWipes++;
+        }
+        if (maxWipes > 0 && session->Wipes < maxWipes)
+        {
+            // Soft-wipe: Reset bosses, resurrect and teleport party to entrance
+            session->TimeAlive = 0;
+            session->SurvivalBuffStacks = 0;
+            session->WipeDebuffStacks++;
+            session->WipeDebuffTimer = 180; // 3 minutes
+
+            // Teleport and revive players
+            for (const auto& pd : session->Players)
+            {
+                Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+                if (!p) continue;
+
+                p->RemoveFlag(PLAYER_FIELD_BYTES, PLAYER_FIELD_BYTE_NO_RELEASE_WINDOW);
+                if (!p->IsAlive())
+                {
+                    p->ResurrectPlayer(1.0f);
+                    p->SpawnCorpseBones();
+                }
+                p->TeleportTo(session->MapId,
+                    session->EntrancePos.GetPositionX(),
+                    session->EntrancePos.GetPositionY(),
+                    session->EntrancePos.GetPositionZ(),
+                    session->EntrancePos.GetOrientation(),
+                    TELE_TO_GM_MODE);
+
+                ApplyWeaknessAura(p, session->WipeDebuffStacks);
+                ApplyAttunementAura(p, 0);
+
+                // Handle NPCBots owned by the player
+                if (BotMgr* botMgr = p->GetBotMgr())
+                {
+                    for (auto const& pair : *botMgr->GetBotMap())
+                    {
+                        Creature* bot = pair.second;
+                        if (bot && bot->IsInWorld())
+                        {
+                            if (!bot->IsAlive())
+                            {
+                                bot->setDeathState(DeathState::Alive);
+                                bot->SetHealth(bot->GetMaxHealth());
+                            }
+                            bot->CombatStop(true);
+                            bot->GetThreatMgr().ClearAllThreat();
+                            bot->GetMotionMaster()->Clear(false);
+                            bot->GetMotionMaster()->MoveIdle();
+                            bot->NearTeleportTo(session->EntrancePos.GetPositionX(),
+                                                session->EntrancePos.GetPositionY(),
+                                                session->EntrancePos.GetPositionZ(),
+                                                session->EntrancePos.GetOrientation());
+                        }
+                    }
+                }
+            }
+
+            // Reset active bosses and creatures
+            Player* pRef = nullptr;
+            for (const auto& pd : session->Players)
+            {
+                pRef = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+                if (pRef)
+                    break;
+            }
+            if (pRef)
+            {
+                for (const auto& sc : session->SpawnedCreatures)
+                {
+                    if (Creature* c = ObjectAccessor::GetCreature(*pRef, sc.Guid))
+                    {
+                        if (c->IsAlive())
+                        {
+                            c->CombatStop(true);
+                            c->GetThreatMgr().ClearAllThreat();
+                            c->GetMotionMaster()->Clear(false);
+                            c->GetMotionMaster()->MoveIdle();
+                            c->NearTeleportTo(c->GetHomePosition().GetPositionX(),
+                                                 c->GetHomePosition().GetPositionY(),
+                                                 c->GetHomePosition().GetPositionZ(),
+                                                 c->GetHomePosition().GetOrientation());
+                            c->SetHealth(c->GetMaxHealth());
+                        }
+                    }
+                }
+            }
+
+            for (const auto& pd : session->Players)
+                if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
+                    if (p->GetSession())
+                    {
+                        if (session->RoguelikeRunId != 0)
+                            ChatHandler(p->GetSession()).SendSysMessage(
+                                "|cFFFF0000[Roguelike]|r Party wiped! Checkpoint respawn triggered. Debuffed with Dungeon Weakness.");
+                        else
+                            ChatHandler(p->GetSession()).SendSysMessage(
+                                "|cFFFF0000[Dungeon Master]|r Party wiped! Checkpoint respawn triggered. Debuffed with Dungeon Weakness.");
+                    }
+
+            SendSessionUpdateToPlayers(session);
+            return;
+        }
+
+        // Lives exhausted: Full failure
         if (session->RoguelikeRunId != 0)
         {
             session->State   = SessionState::Failed;
@@ -1953,7 +2383,11 @@ void DungeonMasterMgr::HandlePlayerDeath(Player* player, Session* session)
             if (!p->IsAlive()) { p->ResurrectPlayer(1.0f); p->SpawnCorpseBones(); }
             if (p->GetSession())
                 ChatHandler(p->GetSession()).SendSysMessage(
-                    "|cFFFF0000[Dungeon Master]|r Total party wipe! Challenge failed.");
+                    "|cFFFF0000[Dungeon Master]|r Lives exhausted! Challenge failed.");
+
+            p->RemoveAura(31785);
+            p->RemoveAura(64162);
+
             p->TeleportTo(psd.ReturnMapId, psd.ReturnPosition.GetPositionX(),
                 psd.ReturnPosition.GetPositionY(), psd.ReturnPosition.GetPositionZ(),
                 psd.ReturnPosition.GetOrientation());
@@ -1972,22 +2406,42 @@ void DungeonMasterMgr::HandlePlayerDeath(Player* player, Session* session)
 void DungeonMasterMgr::DistributeRewards(Session* session)
 {
     if (!session) return;
+    if (session->RewardsDistributed) return;
+    session->RewardsDistributed = true;
+
     const DifficultyTier* diff = sDMConfig->GetDifficulty(session->DifficultyId);
     if (!diff) return;
 
-
     uint32 lvl       = session->EffectiveLevel;
-    uint32 baseGold  = lvl * 500;
-    uint32 mobGold   = session->MobsKilled  * (lvl * 10);
-    uint32 bossGold  = session->BossesKilled * (lvl * 500);
+
+    // Scale gold config values quadratically by level
+    float levelScale = (static_cast<float>(lvl * lvl)) / 400.0f;
+    uint32 baseGold  = static_cast<uint32>(sDMConfig->GetBaseGold() * levelScale);
+    uint32 mobGold   = static_cast<uint32>(sDMConfig->GetGoldPerMob() * session->MobsKilled * levelScale);
+    uint32 bossGold  = static_cast<uint32>(sDMConfig->GetGoldPerBoss() * session->BossesKilled * levelScale);
+
     uint32 total     = static_cast<uint32>((baseGold + mobGold + bossGold) * diff->RewardMultiplier);
     uint32 perPlayer = total / std::max<uint32>(1, session->Players.size());
+
+    // Calculate Clear Speed Efficiency Bonus
+    uint32 elapsed = 0;
+    if (session->EndTime > session->StartTime)
+        elapsed = static_cast<uint32>(session->EndTime - session->StartTime);
+
+    // Expected duration: 15s per trash mob + 120s per boss
+    uint32 expectedTime = (session->MobsKilled * 15) + (session->BossesKilled * 120);
+    float speedMult = 1.0f;
+    if (expectedTime > 0 && elapsed < expectedTime)
+    {
+        // Up to +25% bonus for completing faster
+        speedMult = 1.0f + 0.25f * (1.0f - (static_cast<float>(elapsed) / expectedTime));
+    }
 
     uint8 rewardLevel = static_cast<uint8>(std::min<uint32>(lvl, 80));
 
     LOG_INFO("module", "DungeonMaster: DistributeRewards — EffectiveLevel={}, rewardLevel={}, "
-        "rewardPool={} items, players={}",
-        lvl, rewardLevel, _rewardItems.size(), session->Players.size());
+        "rewardPool={} items, players={}, elapsed={}s, expected={}s, speedMult={:.2f}",
+        lvl, rewardLevel, _rewardItems.size(), session->Players.size(), elapsed, expectedTime, speedMult);
 
     for (const auto& pd : session->Players)
     {
@@ -1998,18 +2452,75 @@ void DungeonMasterMgr::DistributeRewards(Session* session)
             continue;
         }
 
-        // Gold goes directly to wallet
-        GiveGoldReward(p, perPlayer);
+        // Earn Mastery Point
+        EarnMasteryPoint(p);
 
-        // Completion item: roll epic first, then rare, fallback green
-        // Item goes directly to inventory (mail fallback if bags full)
-        uint8 quality = 2;  // green baseline
-        if (RandInt<uint32>(1, 100) <= sDMConfig->GetEpicChance())
-            quality = 4;
-        else if (RandInt<uint32>(1, 100) <= sDMConfig->GetRareChance())
-            quality = 3;
+        // Update Personal Best
+        UpdatePersonalBest(p, session->MapId, session->DifficultyId, elapsed);
 
-        GiveItemReward(p, rewardLevel, quality);
+        // Apply Dungeon Fatigue (diminishing returns)
+        float fatigueMult = GetPlayerMapHistoryMultiplier(pd.PlayerGuid, session->MapId);
+
+        // Calculate Gambit Multiplier
+        uint32 active_gambit_count = 0;
+        if (session->GambitTimeTrial) active_gambit_count++;
+        if (session->GambitGlassCannon) active_gambit_count++;
+        if (session->GambitPacifist) active_gambit_count++;
+        float gambitMult = 1.0f + 0.25f * active_gambit_count;
+
+        // Gold goes directly to wallet (scaled by history fatigue, clear speed, and gambits)
+        uint32 finalGold = static_cast<uint32>(perPlayer * fatigueMult * speedMult * gambitMult);
+        GiveGoldReward(p, finalGold);
+
+        // Item drop chance: roll epic first, then rare, fallback green (scaled by history fatigue and gambits)
+        uint32 finalItemChance = static_cast<uint32>(sDMConfig->GetItemChance() * fatigueMult * gambitMult);
+        uint32 rewardedItemId = 0;
+        bool isMailed = false;
+        if (RandInt<uint32>(1, 100) <= finalItemChance)
+        {
+            // Roll once for quality: roll <= epicChance -> epic, roll <= rareChance -> rare, else green
+            uint32 roll = RandInt<uint32>(1, 100);
+            uint8 quality = 2; // green baseline
+            if (roll <= sDMConfig->GetEpicChance())
+                quality = 4;
+            else if (roll <= sDMConfig->GetRareChance())
+                quality = 3;
+
+            rewardedItemId = GiveItemReward(p, rewardLevel, quality, isMailed);
+        }
+
+        // Send DMDATA:REWARD message to player
+        if (p->GetSession())
+        {
+            char rewardBuf[128];
+            snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:%u,%u,%u", finalGold, rewardedItemId, isMailed ? 1 : 0);
+            ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+        }
+
+        // Inform player of rewards and fatigue/speed run status
+        if (p->GetSession())
+        {
+            if (fatigueMult < 1.0f)
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "|cFFFF0000[Dungeon Master]|r Dungeon Fatigue active! Rewards reduced to %u%%. Try a different dungeon next time.",
+                    static_cast<uint32>(fatigueMult * 100.0f));
+                ChatHandler(p->GetSession()).SendSysMessage(buf);
+            }
+            if (speedMult > 1.0f)
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "|cFF00FF00[Dungeon Master]|r Speed Run Bonus! +%u%% extra gold/XP awarded for efficient clear.",
+                    static_cast<uint32>((speedMult - 1.0f) * 100.0f));
+                ChatHandler(p->GetSession()).SendSysMessage(buf);
+            }
+        }
+    }
+
+    // After distributing rewards, update history
+    for (const auto& pd : session->Players)
+    {
+        UpdatePlayerMapHistory(pd.PlayerGuid, session->MapId);
     }
 }
 
@@ -2050,10 +2561,21 @@ void DungeonMasterMgr::GiveGoldReward(Player* player, uint32 amount)
     }
 }
 
-void DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality)
+static void SendItemQueryResponse(Player* player, uint32 itemEntry)
 {
+    if (!player || !player->GetSession())
+        return;
+
+    WorldPacket packet(CMSG_ITEM_QUERY_SINGLE, 4);
+    packet << uint32(itemEntry);
+    player->GetSession()->HandleItemQuerySingleOpcode(packet);
+}
+
+uint32 DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality, bool& outMailed)
+{
+    outMailed = false;
     uint32 playerClass = player->getClass();
-    uint32 itemEntry = SelectRewardItem(level, quality, playerClass);
+    uint32 itemEntry = SelectRewardItem(level, quality, player);
 
     // Quality fallback: if requested quality isn't found, try lower qualities
     // but still maintain level appropriateness
@@ -2062,7 +2584,7 @@ void DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality
         LOG_WARN("module", "DungeonMaster: No quality {} items for level {}, class {}. Trying lower quality...",
             quality, level, playerClass);
         for (uint8 q = quality - 1; q >= 2 && !itemEntry; --q)
-            itemEntry = SelectRewardItem(level, q, playerClass);
+            itemEntry = SelectRewardItem(level, q, player);
     }
 
     if (!itemEntry)
@@ -2073,7 +2595,7 @@ void DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality
         if (player->GetSession())
             ChatHandler(player->GetSession()).SendSysMessage(
                 "|cFFFF0000[Dungeon Master]|r No suitable gear found for your level and class. Gold only.");
-        return;
+        return 0;
     }
 
     LOG_INFO("module", "DungeonMaster: Giving item {} to {} (level {}, quality {}, class {})",
@@ -2085,6 +2607,7 @@ void DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality
         if (Item* item = player->StoreNewItem(dest, itemEntry, true))
         {
             player->SendNewItem(item, 1, true, false);
+            SendItemQueryResponse(player, itemEntry);
             if (const ItemTemplate* t = sObjectMgr->GetItemTemplate(itemEntry))
             {
                 if (player->GetSession())
@@ -2110,6 +2633,8 @@ void DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality
                     MailReceiver(player, player->GetGUID().GetCounter()),
                     MailSender(MAIL_NORMAL, 0, MAIL_STATIONERY_GM));
             CharacterDatabase.CommitTransaction(trans);
+            outMailed = true;
+            SendItemQueryResponse(player, itemEntry);
             if (player->GetSession())
                 ChatHandler(player->GetSession()).SendSysMessage(
                     "|cFFFFD700[Dungeon Master]|r Bags full! Reward mailed to you.");
@@ -2119,6 +2644,7 @@ void DungeonMasterMgr::GiveItemReward(Player* player, uint8 level, uint8 quality
             LOG_ERROR("module", "DungeonMaster: Failed to create mail item {} for {}", itemEntry, player->GetName());
         }
     }
+    return itemEntry;
 }
 
     // Mail a reward item to player
@@ -2128,13 +2654,13 @@ void DungeonMasterMgr::MailItemReward(Player* player, uint8 level, uint8 quality
     if (!player || !player->IsInWorld()) return;
 
     uint32 playerClass = player->getClass();
-    uint32 itemEntry = SelectRewardItem(level, quality, playerClass);
+    uint32 itemEntry = SelectRewardItem(level, quality, player);
 
     // Quality fallback
     if (!itemEntry && quality > 2)
     {
         for (uint8 q = quality - 1; q >= 2 && !itemEntry; --q)
-            itemEntry = SelectRewardItem(level, q, playerClass);
+            itemEntry = SelectRewardItem(level, q, player);
     }
 
     // Level window fallback
@@ -2180,6 +2706,8 @@ void DungeonMasterMgr::MailItemReward(Player* player, uint8 level, uint8 quality
 
         CharacterDatabase.CommitTransaction(trans);
 
+        SendItemQueryResponse(player, itemEntry);
+
         if (const ItemTemplate* t = sObjectMgr->GetItemTemplate(itemEntry))
         {
             if (player->GetSession())
@@ -2203,8 +2731,9 @@ void DungeonMasterMgr::DistributeRoguelikeRewards(uint32 tier, uint8 effectiveLe
 {
     uint8 rewardLevel = static_cast<uint8>(std::min<uint32>(effectiveLevel, 80));
 
-
-    uint32 baseGold = effectiveLevel * 500u;
+    // Scale gold config values quadratically by level
+    float levelScale = (static_cast<float>(effectiveLevel * effectiveLevel)) / 400.0f;
+    uint32 baseGold = static_cast<uint32>(sDMConfig->GetBaseGold() * levelScale);
     uint32 tierGold = baseGold * tier;
 
     // Epic chance scales with tier
@@ -2231,26 +2760,77 @@ void DungeonMasterMgr::DistributeRoguelikeRewards(uint32 tier, uint8 effectiveLe
 
         // Gold
         GiveGoldReward(p, tierGold);
+        if (p->GetSession())
+        {
+            char rewardBuf[128];
+            snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:%u,0,0", tierGold);
+            ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+        }
 
         // Items go directly to inventory (mail fallback if bags full)
 
         // Guaranteed epic items
         for (uint32 i = 0; i < epicItems; ++i)
-            GiveItemReward(p, rewardLevel, 4);
+        {
+            bool isMailed = false;
+            uint32 item = GiveItemReward(p, rewardLevel, 4, isMailed);
+            if (p->GetSession() && item > 0)
+            {
+                char rewardBuf[128];
+                snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:0,%u,%u", item, isMailed ? 1 : 0);
+                ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+            }
+        }
 
         // Roll for bonus epics
         if (epicItems == 0 && RandInt<uint32>(1, 100) <= epicChance)
-            GiveItemReward(p, rewardLevel, 4);
+        {
+            bool isMailed = false;
+            uint32 item = GiveItemReward(p, rewardLevel, 4, isMailed);
+            if (p->GetSession() && item > 0)
+            {
+                char rewardBuf[128];
+                snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:0,%u,%u", item, isMailed ? 1 : 0);
+                ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+            }
+        }
         else if (epicItems > 0 && tier >= 9 && RandInt<uint32>(1, 100) <= 25)
-            GiveItemReward(p, rewardLevel, 4);
+        {
+            bool isMailed = false;
+            uint32 item = GiveItemReward(p, rewardLevel, 4, isMailed);
+            if (p->GetSession() && item > 0)
+            {
+                char rewardBuf[128];
+                snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:0,%u,%u", item, isMailed ? 1 : 0);
+                ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+            }
+        }
 
         // Blue items
         for (uint32 i = 0; i < blueItems; ++i)
-            GiveItemReward(p, rewardLevel, 3);
+        {
+            bool isMailed = false;
+            uint32 item = GiveItemReward(p, rewardLevel, 3, isMailed);
+            if (p->GetSession() && item > 0)
+            {
+                char rewardBuf[128];
+                snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:0,%u,%u", item, isMailed ? 1 : 0);
+                ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+            }
+        }
 
         // Green items
         for (uint32 i = 0; i < greenItems; ++i)
-            GiveItemReward(p, rewardLevel, 2);
+        {
+            bool isMailed = false;
+            uint32 item = GiveItemReward(p, rewardLevel, 2, isMailed);
+            if (p->GetSession() && item > 0)
+            {
+                char rewardBuf[128];
+                snprintf(rewardBuf, sizeof(rewardBuf), "DMDATA:REWARD:0,%u,%u", item, isMailed ? 1 : 0);
+                ChatHandler(p->GetSession()).SendSysMessage(rewardBuf);
+            }
+        }
 
         if (p->GetSession())
             ChatHandler(p->GetSession()).SendSysMessage(
@@ -2277,33 +2857,42 @@ static uint32 GetClassBitmask(uint32 playerClass)
     return 1 << (playerClass - 1);
 }
 
-// Primary stat for class-based reward weighting
+// Primary stat for class-based reward weighting based on spec
 // Returns: ITEM_MOD_AGILITY(3), ITEM_MOD_STRENGTH(4), ITEM_MOD_INTELLECT(5)
-static uint32 GetPrimaryStatForClass(uint32 playerClass)
+static uint32 GetPrimaryStatForPlayer(Player* player)
 {
+    uint32 playerClass = player->getClass();
+    uint8 specTab = player->GetMostPointsTalentTree(); // returns 0, 1, or 2
+
     switch (playerClass)
     {
-        case 1:  return 4;  // Warrior  -> STR
-        case 2:  return 4;  // Paladin  -> STR
-        case 3:  return 3;  // Hunter   -> AGI
-        case 4:  return 3;  // Rogue    -> AGI
-        case 5:  return 5;  // Priest   -> INT
-        case 6:  return 4;  // DK       -> STR
-        case 7:  return 5;  // Shaman   -> INT
-        case 8:  return 5;  // Mage     -> INT
-        case 9:  return 5;  // Warlock  -> INT
-        case 11: return 3;  // Druid    -> AGI
+        case 1:  return 4;  // Warrior -> STR
+        case 2:             // Paladin
+            if (specTab == 0) return 5; // Holy -> INT
+            return 4;                   // Prot/Ret -> STR
+        case 3:  return 3;  // Hunter -> AGI
+        case 4:  return 3;  // Rogue -> AGI
+        case 5:  return 5;  // Priest -> INT
+        case 6:  return 4;  // DK -> STR
+        case 7:             // Shaman
+            if (specTab == 1) return 3; // Enhancement -> AGI
+            return 5;                   // Ele/Resto -> INT
+        case 8:  return 5;  // Mage -> INT
+        case 9:  return 5;  // Warlock -> INT
+        case 11:            // Druid
+            if (specTab == 1) return 3; // Feral -> AGI
+            return 5;                   // Balance/Resto -> INT
         default: return 4;
     }
 }
 
 // Score item stat alignment with player class (0.0 = bad, 1.0 = perfect match)
-static float ScoreItemForClass(uint32 itemEntry, uint32 playerClass)
+static float ScoreItemForClass(uint32 itemEntry, Player* player)
 {
     const ItemTemplate* proto = sObjectMgr->GetItemTemplate(itemEntry);
     if (!proto) return 0.0f;
 
-    uint32 primaryStat = GetPrimaryStatForClass(playerClass);
+    uint32 primaryStat = GetPrimaryStatForPlayer(player);
     float totalStats = 0.0f;
     float primaryTotal = 0.0f;
 
@@ -2322,8 +2911,50 @@ static float ScoreItemForClass(uint32 itemEntry, uint32 playerClass)
     return primaryTotal / totalStats;
 }
 
-uint32 DungeonMasterMgr::SelectRewardItem(uint8 level, uint8 quality, uint32 playerClass)
+// Fallback overload for class-based scoring (used by loot drops where player spec is unknown)
+static float ScoreItemForClass(uint32 itemEntry, uint32 playerClass)
 {
+    const ItemTemplate* proto = sObjectMgr->GetItemTemplate(itemEntry);
+    if (!proto) return 0.0f;
+
+    uint32 primaryStat = 4; // default STR
+    switch (playerClass)
+    {
+        case 1:  primaryStat = 4; break; // Warrior -> STR
+        case 2:  primaryStat = 4; break; // Paladin -> STR
+        case 3:  primaryStat = 3; break; // Hunter -> AGI
+        case 4:  primaryStat = 3; break; // Rogue -> AGI
+        case 5:  primaryStat = 5; break; // Priest -> INT
+        case 6:  primaryStat = 4; break; // DK -> STR
+        case 7:  primaryStat = 5; break; // Shaman -> INT
+        case 8:  primaryStat = 5; break; // Mage -> INT
+        case 9:  primaryStat = 5; break; // Warlock -> INT
+        case 11: primaryStat = 3; break; // Druid -> AGI
+        default: primaryStat = 4; break;
+    }
+
+    float totalStats = 0.0f;
+    float primaryTotal = 0.0f;
+
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_STATS; ++i)
+    {
+        int32 val = proto->ItemStat[i].ItemStatValue;
+        uint32 type = proto->ItemStat[i].ItemStatType;
+        if (val <= 0) continue;
+
+        totalStats += static_cast<float>(val);
+        if (type == primaryStat)
+            primaryTotal += static_cast<float>(val);
+    }
+
+    if (totalStats <= 0.0f) return 0.5f;
+    return primaryTotal / totalStats;
+}
+
+uint32 DungeonMasterMgr::SelectRewardItem(uint8 level, uint8 quality, Player* player)
+{
+    if (!player) return 0;
+    uint32 playerClass = player->getClass();
     uint8  maxArmor   = GetMaxArmorSubclass(playerClass);
     uint32 classMask  = GetClassBitmask(playerClass);
 
@@ -2375,7 +3006,7 @@ uint32 DungeonMasterMgr::SelectRewardItem(uint8 level, uint8 quality, uint32 pla
                 std::vector<std::pair<uint32, float>> scored;
                 scored.reserve(cands.size());
                 for (uint32 entry : cands)
-                    scored.push_back({entry, ScoreItemForClass(entry, playerClass)});
+                    scored.push_back({entry, ScoreItemForClass(entry, player)});
 
                 std::sort(scored.begin(), scored.end(),
                     [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -2489,6 +3120,14 @@ uint32 DungeonMasterMgr::SelectLootItem(uint8 level, uint8 minQuality, uint8 max
 void DungeonMasterMgr::FillCreatureLoot(Creature* creature, Session* session, bool isBoss)
 {
     if (!creature || !session) return;
+
+    if (!isBoss && session->GambitPacifist)
+    {
+        Loot& loot = creature->loot;
+        loot.clear();
+        loot.gold = 0;
+        return;
+    }
 
     Loot& loot = creature->loot;
     loot.clear();
@@ -2653,13 +3292,213 @@ void DungeonMasterMgr::FillCreatureLoot(Creature* creature, Session* session, bo
         creature->GetName(), creature->GetGUID().GetCounter(), isBoss, level, loot.gold, itemsAdded);
 }
 
+void DungeonMasterMgr::SendSessionUpdateToPlayers(Session* session)
+{
+    if (!session)
+        return;
+
+    for (const auto& pd : session->Players)
+    {
+        Player* player = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+        if (!player || !player->GetSession())
+            continue;
+
+        uint32 cooldownRem = GetRemainingCooldown(player->GetGUID());
+        
+        RoguelikeRun* run = sRoguelikeMgr->GetRunByPlayer(player->GetGUID());
+        bool inRoguelike = (run != nullptr && run->IsActive());
+        uint32 rlTier = inRoguelike ? run->CurrentTier : 0;
+        uint32 rlFloors = inRoguelike ? run->DungeonsCleared : 0;
+
+        char buf[256];
+        snprintf(buf, sizeof(buf), "DMDATA:FLAGS:%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+            sDMConfig->IsEnabled() ? 1 : 0,
+            sDMConfig->IsRoguelikeEnabled() ? 1 : 0,
+            cooldownRem,
+            1, // inSession
+            inRoguelike ? 1 : 0,
+            player->GetLevel(),
+            rlTier,
+            rlFloors,
+            static_cast<uint32>(session->State),
+            session->DifficultyId,
+            session->ScaleToParty ? 1 : 0,
+            session->ThemeId,
+            session->DungeonIndex + 1,
+            sDMConfig->GetBaseGold(),
+            sDMConfig->GetGoldPerMob(),
+            sDMConfig->GetGoldPerBoss(),
+            sDMConfig->GetItemChance(),
+            sDMConfig->GetRareChance(),
+            sDMConfig->GetEpicChance(),
+            sRoguelikeMgr->GetRoguelikePlayerStats(player->GetGUID()).VetoTokens,
+            session->GambitTimeTrial ? 1 : 0,
+            session->GambitGlassCannon ? 1 : 0,
+            session->GambitPacifist ? 1 : 0);
+        ChatHandler(player->GetSession()).SendSysMessage(buf);
+
+        std::string bossName;
+        float bx = 0.0f, by = 0.0f;
+        GetActiveBossInfo(player->GetGUID(), bossName, bx, by);
+        uint32 bossResetCd = GetRemainingBossResetCooldown(player->GetGUID());
+        uint64 elapsed = GameTime::GetGameTime().count() - session->StartTime;
+
+        // Compute remaining teleport delay for completed sessions so the client can show a countdown
+        uint32 teleportRemaining = 0;
+        if (session->State == SessionState::Completed && session->EndTime != 0)
+        {
+            uint32 delay = (session->RoguelikeRunId != 0)
+                ? sDMConfig->GetRoguelikeTransitionDelay()
+                : sDMConfig->GetCompletionTeleportDelay();
+            uint64 sinceEnd = GameTime::GetGameTime().count() - session->EndTime;
+            teleportRemaining = (sinceEnd < delay) ? static_cast<uint32>(delay - sinceEnd) : 0;
+        }
+
+        uint32 maxWipes = sDMConfig->GetMaxWipes();
+        if (session->LeaderGuid && sDungeonMasterMgr->HasMasteryPerk(session->LeaderGuid.GetCounter(), 4))
+        {
+            maxWipes++;
+        }
+
+        snprintf(buf, sizeof(buf), "DMDATA:RUNINFO:%llu,%s,%.1f,%.1f,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+            (unsigned long long)elapsed,
+            bossName.empty() ? "None" : bossName.c_str(),
+            bx, by,
+            bossResetCd,
+            session->SurvivalBuffStacks,
+            session->WipeDebuffStacks,
+            session->WipeDebuffTimer,
+            session->Wipes,
+            maxWipes,
+            session->TimeAlive,
+            teleportRemaining,
+            session->PreparationTimer);
+        ChatHandler(player->GetSession()).SendSysMessage(buf);
+
+        std::string affList;
+        if (session->RoguelikeRunId != 0)
+        {
+            if (RoguelikeRun* run = sRoguelikeMgr->GetRun(session->RoguelikeRunId))
+            {
+                for (RoguelikeAffix afxId : run->ActiveAffixes)
+                {
+                    if (!affList.empty()) affList += ",";
+                    affList += std::to_string(afxId);
+                }
+            }
+        }
+        snprintf(buf, sizeof(buf), "DMDATA:ACTIVE_AFFIXES:%s", affList.c_str());
+        ChatHandler(player->GetSession()).SendSysMessage(buf);
+    }
+}
+
+void DungeonMasterMgr::SendInactiveUpdateToPlayers(const std::vector<ObjectGuid>& playerGuids)
+{
+    for (ObjectGuid guid : playerGuids)
+    {
+        Player* player = ObjectAccessor::FindPlayer(guid);
+        if (!player || !player->GetSession())
+            continue;
+
+        uint32 cooldownRem = GetRemainingCooldown(player->GetGUID());
+
+        RoguelikeRun* run = sRoguelikeMgr->GetRunByPlayer(player->GetGUID());
+        bool inRoguelike = (run != nullptr && run->IsActive());
+        uint32 rlTier = inRoguelike ? run->CurrentTier : 0;
+        uint32 rlFloors = inRoguelike ? run->DungeonsCleared : 0;
+
+        char buf[256];
+        snprintf(buf, sizeof(buf), "DMDATA:FLAGS:%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+            sDMConfig->IsEnabled() ? 1 : 0,
+            sDMConfig->IsRoguelikeEnabled() ? 1 : 0,
+            cooldownRem,
+            0, // inSession = 0
+            inRoguelike ? 1 : 0,
+            player->GetLevel(),
+            rlTier,
+            rlFloors,
+            0, // sessionState
+            0, // diffId
+            1, // scaleParty
+            0, // themeId
+            0, // mapId
+            sDMConfig->GetBaseGold(),
+            sDMConfig->GetGoldPerMob(),
+            sDMConfig->GetGoldPerBoss(),
+            sDMConfig->GetItemChance(),
+            sDMConfig->GetRareChance(),
+            sDMConfig->GetEpicChance(),
+            sRoguelikeMgr->GetRoguelikePlayerStats(player->GetGUID()).VetoTokens,
+            0, // GambitTimeTrial
+            0, // GambitGlassCannon
+            0); // GambitPacifist
+        ChatHandler(player->GetSession()).SendSysMessage(buf);
+        snprintf(buf, sizeof(buf), "DMDATA:ACTIVE_AFFIXES:");
+        ChatHandler(player->GetSession()).SendSysMessage(buf);
+    }
+}
+
+void DungeonMasterMgr::SendRaidWarningToPlayers(Session* session, const std::string& message)
+{
+    if (!session || message.empty())
+        return;
+
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_RAID_WARNING, LANG_UNIVERSAL, nullptr, nullptr, message);
+
+    for (const auto& pd : session->Players)
+    {
+        Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+        if (p && p->IsInWorld() && p->GetSession())
+        {
+            p->GetSession()->SendPacket(&data);
+        }
+    }
+}
+
+void DungeonMasterMgr::ApplyAttunementAura(Player* player, uint32 stacks)
+{
+    if (!player || !player->IsInWorld())
+        return;
+
+    player->RemoveAura(31785);
+
+    if (stacks > 0)
+    {
+        if (Aura* aura = player->AddAura(31785, player))
+        {
+            aura->SetStackAmount(static_cast<uint8>(stacks));
+            aura->SetMaxDuration(-1);
+            aura->SetDuration(-1);
+        }
+    }
+}
+
+void DungeonMasterMgr::ApplyWeaknessAura(Player* player, uint32 stacks)
+{
+    if (!player || !player->IsInWorld())
+        return;
+
+    player->RemoveAura(64162);
+
+    if (stacks > 0)
+    {
+        if (Aura* aura = player->AddAura(64162, player))
+        {
+            aura->SetStackAmount(static_cast<uint8>(stacks));
+            aura->SetMaxDuration(-1);
+            aura->SetDuration(-1);
+        }
+    }
+}
+
 // Session end / cleanup
 void DungeonMasterMgr::EndSession(uint32 sessionId, bool success)
 {
     // Check if roguelike session
     uint32 roguelikeRunId = 0;
     {
-        std::lock_guard<std::mutex> lock(_sessionMutex);
+        std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
         auto it = _activeSessions.find(sessionId);
         if (it == _activeSessions.end()) return;
 
@@ -2679,7 +3518,12 @@ void DungeonMasterMgr::EndSession(uint32 sessionId, bool success)
             if (savedInstanceId != 0)
                 _instanceToSession.erase(savedInstanceId);
             for (const auto& pd : s.Players)
+            {
                 _playerToSession.erase(pd.PlayerGuid);
+                char query[256];
+                snprintf(query, sizeof(query), "DELETE FROM `dm_player_return_position` WHERE `guid` = %u", pd.PlayerGuid.GetCounter());
+                CharacterDatabase.Execute(query);
+            }
 
             _activeSessions.erase(it);
         }
@@ -2692,7 +3536,7 @@ void DungeonMasterMgr::EndSession(uint32 sessionId, bool success)
     }
 
     // --- Normal (non-roguelike) session ---
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto it = _activeSessions.find(sessionId);
     if (it == _activeSessions.end()) return;
 
@@ -2709,7 +3553,18 @@ void DungeonMasterMgr::EndSession(uint32 sessionId, bool success)
                             : "|cFFFF0000[Dungeon Master]|r Challenge ended. No rewards given.");
 
     if (success && s.State == SessionState::Completed)
+    {
+        if (sDMConfig->IsBestiaryEnabled())
+        {
+            for (const auto& pd : s.Players)
+            {
+                uint32 guidLow = pd.PlayerGuid.GetCounter();
+                IncrementBestiaryMetaRunsCompleted(guidLow, s.MapId);
+                SavePlayerDungeonData(guidLow);
+            }
+        }
         DistributeRewards(&s);
+    }
 
     UpdatePlayerStatsFromSession(s, success);
     if (success && s.State == SessionState::Completed)
@@ -2721,13 +3576,21 @@ void DungeonMasterMgr::EndSession(uint32 sessionId, bool success)
     uint32 savedInstanceId = s.InstanceId;
     CleanupSession(s);
 
-    for (const auto& pd : s.Players)
-        SetCooldown(pd.PlayerGuid);
+    if (savedInstanceId != 0)
+    {
+        for (const auto& pd : s.Players)
+            SetCooldown(pd.PlayerGuid);
+    }
 
     if (savedInstanceId != 0)
         _instanceToSession.erase(savedInstanceId);
     for (const auto& pd : s.Players)
+    {
         _playerToSession.erase(pd.PlayerGuid);
+        char query[256];
+        snprintf(query, sizeof(query), "DELETE FROM `dm_player_return_position` WHERE `guid` = %u", pd.PlayerGuid.GetCounter());
+        CharacterDatabase.Execute(query);
+    }
 
     _activeSessions.erase(it);
 }
@@ -2737,7 +3600,7 @@ void DungeonMasterMgr::AbandonSession(uint32 id) { EndSession(id, false); }
 
 void DungeonMasterMgr::CleanupRoguelikeSession(uint32 sessionId, bool success)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto it = _activeSessions.find(sessionId);
     if (it == _activeSessions.end()) return;
 
@@ -2755,7 +3618,12 @@ void DungeonMasterMgr::CleanupRoguelikeSession(uint32 sessionId, bool success)
     if (savedInstanceId != 0)
         _instanceToSession.erase(savedInstanceId);
     for (const auto& pd : s.Players)
+    {
         _playerToSession.erase(pd.PlayerGuid);
+        char query[256];
+        snprintf(query, sizeof(query), "DELETE FROM `dm_player_return_position` WHERE `guid` = %u", pd.PlayerGuid.GetCounter());
+        CharacterDatabase.Execute(query);
+    }
 
     _activeSessions.erase(it);
 
@@ -2909,18 +3777,26 @@ void DungeonMasterMgr::GetActiveBossInfo(ObjectGuid playerGuid, std::string& bos
     if (!session)
         return;
 
+    uint32 bossEntry = 0;
     ObjectGuid bossGuid;
     for (const auto& sc : session->SpawnedCreatures)
     {
         if (sc.IsBoss && !sc.IsDead)
         {
             bossGuid = sc.Guid;
+            bossEntry = sc.Entry;
             break;
         }
     }
 
-    if (bossGuid.IsEmpty())
+    if (bossEntry == 0)
         return;
+
+    // Use creature template to get name (extremely robust, doesn't require grid visibility)
+    if (const CreatureTemplate* cInfo = sObjectMgr->GetCreatureTemplate(bossEntry))
+    {
+        bossName = cInfo->Name;
+    }
 
     Player* player = ObjectAccessor::FindConnectedPlayer(playerGuid);
     if (!player)
@@ -2929,9 +3805,9 @@ void DungeonMasterMgr::GetActiveBossInfo(ObjectGuid playerGuid, std::string& bos
     Creature* boss = ObjectAccessor::GetCreature(*player, bossGuid);
     if (boss)
     {
-        bossName = boss->GetName();
         x = boss->GetPositionX();
         y = boss->GetPositionY();
+        bossName = boss->GetName();
     }
 }
 
@@ -3212,7 +4088,7 @@ float DungeonMasterMgr::CalculateDamageMultiplier(const Session* s) const
 // Check if creature belongs to an active session
 bool DungeonMasterMgr::IsSessionCreature(ObjectGuid playerGuid, ObjectGuid creatureGuid)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto pit = _playerToSession.find(playerGuid);
     if (pit == _playerToSession.end())
         return false;
@@ -3227,7 +4103,7 @@ bool DungeonMasterMgr::IsSessionCreature(ObjectGuid playerGuid, ObjectGuid creat
 // Check if creature is a session boss
 bool DungeonMasterMgr::IsSessionBoss(ObjectGuid playerGuid, ObjectGuid creatureGuid)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto pit = _playerToSession.find(playerGuid);
     if (pit == _playerToSession.end())
         return false;
@@ -3249,7 +4125,7 @@ bool DungeonMasterMgr::IsSessionBoss(ObjectGuid playerGuid, ObjectGuid creatureG
 float DungeonMasterMgr::GetSessionCreatureDamageScale(
     ObjectGuid playerGuid, ObjectGuid creatureGuid)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto pit = _playerToSession.find(playerGuid);
     if (pit == _playerToSession.end())
         return 1.0f;
@@ -3340,7 +4216,7 @@ float DungeonMasterMgr::GetSessionCreatureDamageScale(
 // Scale environmental damage to party level
 float DungeonMasterMgr::GetEnvironmentalDamageScale(ObjectGuid playerGuid)
 {
-    std::lock_guard<std::mutex> lock(_sessionMutex);
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
     auto pit = _playerToSession.find(playerGuid);
     if (pit == _playerToSession.end())
         return 1.0f;
@@ -3354,7 +4230,7 @@ float DungeonMasterMgr::GetEnvironmentalDamageScale(ObjectGuid playerGuid)
     if (!session.ScaleToParty)
         return 1.0f;
 
-    const DungeonInfo* dg = sDMConfig->GetDungeon(session.MapId);
+    const DungeonInfo* dg = sDMConfig->GetDungeon(session.DungeonIndex);
     if (!dg)
         return 1.0f;
 
@@ -3384,13 +4260,98 @@ void DungeonMasterMgr::Update(uint32 diff)
     std::vector<std::pair<uint32, uint32>> roguelikeCompleted; // {runId, sessionId}
 
     {
-        std::lock_guard<std::mutex> lock(_sessionMutex);
+        std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
 
         for (auto& [sid, session] : _activeSessions)
         {
             // ---- Poll creature deaths ----
             if (session.IsActive())
             {
+                // Increment survival time and update stacks
+                session.TimeAlive += 1;
+                session.SurvivalBuffStacks = session.TimeAlive / 300;
+
+                // Decrement wipe weakness timer
+                if (session.WipeDebuffTimer > 0)
+                {
+                    session.WipeDebuffTimer -= 1;
+                    if (session.WipeDebuffTimer == 0)
+                    {
+                        session.WipeDebuffStacks = 0;
+                    }
+                }
+
+                // Decrement preparation timer for roguelike sessions
+                if (session.State == SessionState::Preparing && session.RoguelikeRunId != 0)
+                {
+                    if (session.PreparationTimer > 0)
+                    {
+                        session.PreparationTimer -= 1;
+                        uint32 remaining = session.PreparationTimer;
+
+                        // Announce countdown at 20s, 10s, and 5-1s
+                        if (remaining == 20 || remaining == 10 || (remaining <= 5 && remaining >= 1))
+                        {
+                            char timerBuf[256];
+                            snprintf(timerBuf, sizeof(timerBuf), "|cFF00FFFF[Roguelike]|r Preparation phase ends in |cFFFFFFFF%u|r second%s...", remaining, remaining != 1 ? "s" : "");
+                            for (const auto& pd : session.Players)
+                                if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
+                                    ChatHandler(p->GetSession()).SendSysMessage(timerBuf);
+                        }
+
+                        if (session.PreparationTimer == 0)
+                        {
+                            session.State = SessionState::InProgress;
+                            session.StartTime = GameTime::GetGameTime().count();
+                            for (const auto& pd : session.Players)
+                                if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
+                                    ChatHandler(p->GetSession()).SendSysMessage("|cFF00FFFF[Roguelike]|r Preparation complete! Dungeon start!");
+
+                            // Send updated flags/info to client to close preparation countdown
+                            SendSessionUpdateToPlayers(&session);
+                        }
+                    }
+                }
+
+                // Sync auras on players
+                for (const auto& pd : session.Players)
+                {
+                    if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
+                    {
+                        // Attunement
+                        if (session.SurvivalBuffStacks > 0)
+                        {
+                            if (!p->HasAura(31785) || (p->GetAura(31785) && p->GetAura(31785)->GetStackAmount() != session.SurvivalBuffStacks))
+                            {
+                                ApplyAttunementAura(p, session.SurvivalBuffStacks);
+                            }
+                        }
+                        else
+                        {
+                            if (p->HasAura(31785))
+                            {
+                                p->RemoveAura(31785);
+                            }
+                        }
+
+                        // Weakness
+                        if (session.WipeDebuffStacks > 0)
+                        {
+                            if (!p->HasAura(64162) || (p->GetAura(64162) && p->GetAura(64162)->GetStackAmount() != session.WipeDebuffStacks))
+                            {
+                                ApplyWeaknessAura(p, session.WipeDebuffStacks);
+                            }
+                        }
+                        else
+                        {
+                            if (p->HasAura(64162))
+                            {
+                                p->RemoveAura(64162);
+                            }
+                        }
+                    }
+                }
+
                 Player* ref = nullptr;
                 for (const auto& pd : session.Players)
                 {
@@ -3416,7 +4377,7 @@ void DungeonMasterMgr::Update(uint32 diff)
                     }
 
                     // ---- Populate if not yet done ----
-                    if (session.TotalMobs == 0 && session.TotalBosses == 0)
+                    if (session.TotalMobs == 0 && session.TotalBosses == 0 && session.State != SessionState::Preparing)
                     {
                         Map* m = ref->GetMap();
                         if (m && m->IsDungeon())
@@ -3433,6 +4394,8 @@ void DungeonMasterMgr::Update(uint32 diff)
                                             "|cFF00FF00[Dungeon Master]|r Preparing the challenge...");
 
                                 PopulateDungeon(&session, inst);
+
+                                SendSessionUpdateToPlayers(&session);
 
                                 LOG_INFO("module", "DungeonMaster: Session {} — populated (map {}, mobs={}, bosses={})",
                                     session.SessionId, session.MapId,
@@ -3536,7 +4499,7 @@ void DungeonMasterMgr::Update(uint32 diff)
 
                                 // Check if it's an elite/boss creature (likely phase 2)
                                 const CreatureTemplate* tmpl = nc->GetCreatureTemplate();
-                                if (!tmpl || (tmpl->rank != 1 && tmpl->rank != 2 && tmpl->rank != 4))
+                                if (!tmpl || (tmpl->rank != 1 && tmpl->rank != 2 && tmpl->rank != 3 && tmpl->rank != 4))
                                     continue;
 
                                 // Promote to boss creature
@@ -3592,6 +4555,9 @@ void DungeonMasterMgr::Update(uint32 diff)
                                 session.State   = SessionState::Completed;
                                 session.EndTime = GameTime::GetGameTime().count();
 
+                                // Distribute rewards immediately so the client can display them
+                                DistributeRewards(&session);
+
                                 uint32 delay = (session.RoguelikeRunId != 0)
                                     ? sDMConfig->GetRoguelikeTransitionDelay()
                                     : sDMConfig->GetCompletionTeleportDelay();
@@ -3603,12 +4569,13 @@ void DungeonMasterMgr::Update(uint32 diff)
                                             char buf[256];
                                             snprintf(buf, sizeof(buf),
                                                 "|cFF00FF00[Dungeon Master]|r %s "
-                                                "Rewards in |cFFFFFFFF%u|r seconds...",
+                                                "Rewards distributed! Teleporting in |cFFFFFFFF%u|r seconds...",
                                                 session.RoguelikeRunId != 0
                                                     ? "Floor cleared!" : "Dungeon complete!",
                                                 delay);
                                             ChatHandler(p->GetSession()).SendSysMessage(buf);
                                         }
+                                SendSessionUpdateToPlayers(&session);
                                 break;
                             }
                         }
@@ -3656,7 +4623,8 @@ void DungeonMasterMgr::Update(uint32 diff)
                                 session.EntrancePos.GetPositionX(),
                                 session.EntrancePos.GetPositionY(),
                                 session.EntrancePos.GetPositionZ(),
-                                session.EntrancePos.GetOrientation());
+                                session.EntrancePos.GetOrientation(),
+                                TELE_TO_GM_MODE);
                             ChatHandler(p->GetSession()).SendSysMessage(
                                 "|cFF00FF00[Dungeon Master]|r Revived at entrance. Get back in there!");
                         }
@@ -3688,26 +4656,40 @@ void DungeonMasterMgr::Update(uint32 diff)
                     : sDMConfig->GetCompletionTeleportDelay();
                 uint64 elapsed = GameTime::GetGameTime().count() - session.EndTime;
 
-                // ---- Roguelike countdown announcements ----
-                if (session.RoguelikeRunId != 0 && elapsed < delay)
+                // ---- Countdown announcements for BOTH Roguelike and standard challenges ----
+                if (elapsed < delay)
                 {
                     uint32 remaining = static_cast<uint32>(delay - elapsed);
-                    static const uint32 announceAt[] = {25, 20, 15, 10, 5, 4, 3, 2, 1};
+
+                    // Use milestone-based tracking instead of exact-match to avoid
+                    // skipped seconds when game tick timing drifts.
+                    // announceAt values from largest to smallest so we announce
+                    // each threshold the first time remaining drops to or below it.
+                    static const uint32 announceAt[] = {30, 25, 20, 15, 10, 5, 4, 3, 2, 1};
                     for (uint32 sec : announceAt)
                     {
-                        if (remaining == sec)
+                        if (remaining <= sec && session.LastCountdownAnnounced > sec)
                         {
-                            char cbuf[128];
-                            snprintf(cbuf, sizeof(cbuf),
-                                "|cFF00FFFF[Roguelike]|r Next dungeon in |cFFFFFFFF%u|r second%s...",
-                                remaining, remaining != 1 ? "s" : "");
+                            session.LastCountdownAnnounced = sec;
+
+                            char chatBuf[256];
+                            if (session.RoguelikeRunId != 0)
+                                snprintf(chatBuf, sizeof(chatBuf), "|cFF00FFFF[Roguelike]|r Next dungeon in |cFFFFFFFF%u|r second%s...", remaining, remaining != 1 ? "s" : "");
+                            else
+                                snprintf(chatBuf, sizeof(chatBuf), "|cFF00FF00[Dungeon Master]|r Teleporting out in |cFFFFFFFF%u|r second%s...", remaining, remaining != 1 ? "s" : "");
+
                             for (const auto& pd3 : session.Players)
                                 if (Player* p3 = ObjectAccessor::FindPlayer(pd3.PlayerGuid))
                                     if (p3->GetSession())
-                                        ChatHandler(p3->GetSession()).SendSysMessage(cbuf);
+                                        ChatHandler(p3->GetSession()).SendSysMessage(chatBuf);
                             break;
                         }
                     }
+                }
+                else
+                {
+                    // Reset for next use (e.g. roguelike floors reuse session struct)
+                    session.LastCountdownAnnounced = 999;
                 }
 
                 if (elapsed >= delay)
@@ -3737,21 +4719,41 @@ void DungeonMasterMgr::Update(uint32 diff)
             }
 
             // ---- Abandoned detection ----
-            if (session.IsActive()
-                && (GameTime::GetGameTime().count() - session.StartTime) >= 15)
+            if (session.IsActive())
             {
                 bool anyone = false;
                 for (const auto& pd : session.Players)
                 {
                     Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
-                    if (p && p->GetMapId() == session.MapId) { anyone = true; break; }
+                    if (p && p->GetMapId() == session.MapId && p->IsInWorld())
+                    {
+                        anyone = true;
+                        break;
+                    }
                 }
-                if (!anyone)
+
+                if (anyone)
                 {
-                    LOG_INFO("module", "DungeonMaster: Session {} abandoned — no players on map {} after grace period",
-                        sid, session.MapId);
-                    session.State = SessionState::Abandoned;
-                    toEnd.emplace_back(sid, false);
+                    session.LastEmptyTime = 0;
+                }
+                else
+                {
+                    uint64 nowTime = GameTime::GetGameTime().count();
+                    if (nowTime - session.StartTime >= 15)
+                    {
+                        if (session.LastEmptyTime == 0)
+                        {
+                            session.LastEmptyTime = nowTime;
+                            LOG_INFO("module", "DungeonMaster: Session {} is now empty of players. Starting 5-minute grace period.", sid);
+                        }
+                        else if (nowTime - session.LastEmptyTime >= 300)
+                        {
+                            LOG_INFO("module", "DungeonMaster: Session {} abandoned — no players on map {} after 5-minute grace period",
+                                sid, session.MapId);
+                            session.State = SessionState::Abandoned;
+                            toEnd.emplace_back(sid, false);
+                        }
+                    }
                 }
             }
         }
@@ -3783,6 +4785,579 @@ std::string DungeonMasterMgr::GetSessionStatusString(const Session* s) const
         s->MobsKilled, s->TotalMobs, s->BossesKilled, s->TotalBosses,
         s->LevelBandMin, s->LevelBandMax);
     return buf;
+}
+
+void DungeonMasterMgr::UpdatePlayerMapHistory(ObjectGuid playerGuid, uint32 mapId)
+{
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
+    auto& history = _playerClearedMapsHistory[playerGuid];
+    
+    // Remove if already exists to move it to the front
+    for (auto it = history.begin(); it != history.end(); )
+    {
+        if (*it == mapId)
+            it = history.erase(it);
+        else
+            ++it;
+    }
+    
+    // Insert at front
+    history.insert(history.begin(), mapId);
+    
+    // Keep only last 3
+    if (history.size() > 3)
+        history.resize(3);
+}
+
+float DungeonMasterMgr::GetPlayerMapHistoryMultiplier(ObjectGuid playerGuid, uint32 mapId)
+{
+    std::lock_guard<std::recursive_mutex> lock(_sessionMutex);
+    auto it = _playerClearedMapsHistory.find(playerGuid);
+    if (it == _playerClearedMapsHistory.end())
+        return 1.0f;
+        
+    const auto& history = it->second;
+    if (history.empty())
+        return 1.0f;
+        
+    if (history[0] == mapId)
+        return 0.50f; // 1st consecutive repeat
+        
+    if (history.size() > 1 && history[1] == mapId)
+        return 0.75f; // 2nd consecutive repeat
+        
+    if (history.size() > 2 && history[2] == mapId)
+        return 0.90f; // 3rd consecutive repeat
+        
+    return 1.0f;
+}
+
+void DungeonMasterMgr::LoadDungeonSpawnCounts()
+{
+    _dungeonSpawnCounts.clear();
+
+    QueryResult result = WorldDatabase.Query("SELECT map, COUNT(*) FROM creature GROUP BY map");
+    if (result)
+    {
+        do
+        {
+            Field* f = result->Fetch();
+            uint32 mapId = f[0].Get<uint32>();
+            uint32 count = f[1].Get<uint32>();
+            _dungeonSpawnCounts[mapId] = count;
+        } while (result->NextRow());
+    }
+    LOG_INFO("module", "DungeonMaster: Loaded spawn counts for {} maps.", _dungeonSpawnCounts.size());
+}
+
+uint32 DungeonMasterMgr::GetDungeonSpawnCount(uint32 mapId) const
+{
+    auto it = _dungeonSpawnCounts.find(mapId);
+    if (it != _dungeonSpawnCounts.end())
+        return it->second;
+    return 0;
+}
+
+// Phase 1: Caching, Loading, Saving, Flushing and Getters for Bestiary / Familiarity
+void DungeonMasterMgr::LoadPlayerDungeonData(uint32 guidLow)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    
+    // Clear existing cache for this player
+    _playerBestiary.erase(guidLow);
+    _playerBestiaryMeta.erase(guidLow);
+    _playerFamiliarity.erase(guidLow);
+    _playerMastery.erase(guidLow);
+    _playerPersonalBests.erase(guidLow);
+
+    // 1. Load Bestiary
+    char q1[256];
+    snprintf(q1, sizeof(q1), "SELECT map_id, creature_type, kill_count FROM dm_dungeon_bestiary WHERE guid = %u", guidLow);
+    QueryResult r1 = CharacterDatabase.Query(q1);
+    if (r1)
+    {
+        do
+        {
+            Field* f = r1->Fetch();
+            uint32 mapId = f[0].Get<uint32>();
+            uint32 creatureType = f[1].Get<uint32>();
+            uint32 killCount = f[2].Get<uint32>();
+            _playerBestiary[guidLow][mapId][creatureType] = killCount;
+        } while (r1->NextRow());
+    }
+
+    // 2. Load Bestiary Meta
+    char q2[256];
+    snprintf(q2, sizeof(q2), "SELECT map_id, boss_encountered, boss_beaten, total_kills, runs_started, runs_completed FROM dm_dungeon_bestiary_meta WHERE guid = %u", guidLow);
+    QueryResult r2 = CharacterDatabase.Query(q2);
+    if (r2)
+    {
+        do
+        {
+            Field* f = r2->Fetch();
+            uint32 mapId = f[0].Get<uint32>();
+            DungeonKnowledgeEntry entry;
+            entry.Guid = guidLow;
+            entry.MapId = mapId;
+            entry.BossEncountered = f[1].Get<bool>();
+            entry.BossBeaten = f[2].Get<bool>();
+            entry.TotalKills = f[3].Get<uint32>();
+            entry.RunsStarted = f[4].Get<uint32>();
+            entry.RunsCompleted = f[5].Get<uint32>();
+            _playerBestiaryMeta[guidLow][mapId] = entry;
+        } while (r2->NextRow());
+    }
+
+    // 3. Load Affix Familiarity
+    char q3[256];
+    snprintf(q3, sizeof(q3), "SELECT affix_id, encounters, resistance_pct FROM dm_affix_familiarity WHERE guid = %u", guidLow);
+    QueryResult r3 = CharacterDatabase.Query(q3);
+    if (r3)
+    {
+        do
+        {
+            Field* f = r3->Fetch();
+            uint32 affixId = f[0].Get<uint32>();
+            AffixFamiliarityEntry entry;
+            entry.Guid = guidLow;
+            entry.AffixId = affixId;
+            entry.Encounters = f[1].Get<uint32>();
+            entry.ResistancePct = f[2].Get<float>();
+            _playerFamiliarity[guidLow][affixId] = entry;
+        } while (r3->NextRow());
+    }
+
+    // 4. Load Player Mastery
+    char q4[256];
+    snprintf(q4, sizeof(q4), "SELECT mastery_points, purchased_mask FROM dm_player_mastery WHERE guid = %u", guidLow);
+    QueryResult r4 = CharacterDatabase.Query(q4);
+    if (r4)
+    {
+        Field* f = r4->Fetch();
+        PlayerMastery entry;
+        entry.Guid = guidLow;
+        entry.MasteryPoints = f[0].Get<uint32>();
+        entry.PurchasedMask = f[1].Get<uint32>();
+        _playerMastery[guidLow] = entry;
+    }
+    else
+    {
+        // Default seed new players to 0 points and 0 mask
+        PlayerMastery entry;
+        entry.Guid = guidLow;
+        entry.MasteryPoints = 0;
+        entry.PurchasedMask = 0;
+        _playerMastery[guidLow] = entry;
+    }
+
+    // 5. Load Personal Bests
+    char q5[256];
+    snprintf(q5, sizeof(q5), "SELECT map_id, difficulty_id, clear_time FROM dm_personal_bests WHERE guid = %u", guidLow);
+    QueryResult r5 = CharacterDatabase.Query(q5);
+    if (r5)
+    {
+        do
+        {
+            Field* f = r5->Fetch();
+            uint32 mapId = f[0].Get<uint32>();
+            uint32 diffId = f[1].Get<uint32>();
+            uint32 clearTime = f[2].Get<uint32>();
+            _playerPersonalBests[guidLow][mapId][diffId] = clearTime;
+        } while (r5->NextRow());
+    }
+}
+
+void DungeonMasterMgr::SavePlayerDungeonData(uint32 guidLow)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+
+    // Save Bestiary
+    auto itBestiary = _playerBestiary.find(guidLow);
+    if (itBestiary != _playerBestiary.end())
+    {
+        for (const auto& [mapId, innerMap] : itBestiary->second)
+        {
+            for (const auto& [creatureType, killCount] : innerMap)
+            {
+                char query[256];
+                snprintf(query, sizeof(query),
+                    "REPLACE INTO dm_dungeon_bestiary (guid, map_id, creature_type, kill_count) VALUES (%u, %u, %u, %u)",
+                    guidLow, mapId, creatureType, killCount);
+                CharacterDatabase.Execute(query);
+            }
+        }
+    }
+
+    // Save Bestiary Meta
+    auto itMeta = _playerBestiaryMeta.find(guidLow);
+    if (itMeta != _playerBestiaryMeta.end())
+    {
+        for (const auto& [mapId, entry] : itMeta->second)
+        {
+            char query[512];
+            snprintf(query, sizeof(query),
+                "REPLACE INTO dm_dungeon_bestiary_meta "
+                "(guid, map_id, boss_encountered, boss_beaten, total_kills, runs_started, runs_completed) "
+                "VALUES (%u, %u, %u, %u, %u, %u, %u)",
+                guidLow, mapId, entry.BossEncountered ? 1 : 0, entry.BossBeaten ? 1 : 0,
+                entry.TotalKills, entry.RunsStarted, entry.RunsCompleted);
+            CharacterDatabase.Execute(query);
+        }
+    }
+
+    // Save Affix Familiarity
+    auto itFam = _playerFamiliarity.find(guidLow);
+    if (itFam != _playerFamiliarity.end())
+    {
+        for (const auto& [affixId, entry] : itFam->second)
+        {
+            char query[256];
+            snprintf(query, sizeof(query),
+                "REPLACE INTO dm_affix_familiarity (guid, affix_id, encounters, resistance_pct) VALUES (%u, %u, %u, %f)",
+                guidLow, affixId, entry.Encounters, entry.ResistancePct);
+            CharacterDatabase.Execute(query);
+        }
+    }
+
+    // Save Player Mastery
+    auto itMast = _playerMastery.find(guidLow);
+    if (itMast != _playerMastery.end())
+    {
+        char query[256];
+        snprintf(query, sizeof(query),
+            "REPLACE INTO dm_player_mastery (guid, mastery_points, purchased_mask) VALUES (%u, %u, %u)",
+            guidLow, itMast->second.MasteryPoints, itMast->second.PurchasedMask);
+        CharacterDatabase.Execute(query);
+    }
+
+    // Save Personal Bests
+    auto itPB = _playerPersonalBests.find(guidLow);
+    if (itPB != _playerPersonalBests.end())
+    {
+        for (const auto& [mapId, innerMap] : itPB->second)
+        {
+            for (const auto& [diffId, clearTime] : innerMap)
+            {
+                char query[256];
+                snprintf(query, sizeof(query),
+                    "REPLACE INTO dm_personal_bests (guid, map_id, difficulty_id, clear_time) VALUES (%u, %u, %u, %u)",
+                    guidLow, mapId, diffId, clearTime);
+                CharacterDatabase.Execute(query);
+            }
+        }
+    }
+}
+
+void DungeonMasterMgr::FlushPlayerDungeonData(uint32 guidLow)
+{
+    SavePlayerDungeonData(guidLow);
+
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    _playerBestiary.erase(guidLow);
+    _playerBestiaryMeta.erase(guidLow);
+    _playerFamiliarity.erase(guidLow);
+    _playerMastery.erase(guidLow);
+    _playerPersonalBests.erase(guidLow);
+}
+
+uint32 DungeonMasterMgr::GetBestiaryKills(uint32 guidLow, uint32 mapId, uint32 creatureType) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerBestiary.find(guidLow);
+    if (it != _playerBestiary.end())
+    {
+        auto it2 = it->second.find(mapId);
+        if (it2 != it->second.end())
+        {
+            auto it3 = it2->second.find(creatureType);
+            if (it3 != it2->second.end())
+                return it3->second;
+        }
+    }
+    return 0;
+}
+
+void DungeonMasterMgr::IncrementBestiaryKills(uint32 guidLow, uint32 mapId, uint32 creatureType, uint32 amount)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    _playerBestiary[guidLow][mapId][creatureType] += amount;
+}
+
+DungeonKnowledgeEntry DungeonMasterMgr::GetBestiaryMeta(uint32 guidLow, uint32 mapId) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerBestiaryMeta.find(guidLow);
+    if (it != _playerBestiaryMeta.end())
+    {
+        auto it2 = it->second.find(mapId);
+        if (it2 != it->second.end())
+            return it2->second;
+    }
+    DungeonKnowledgeEntry entry;
+    entry.Guid = guidLow;
+    entry.MapId = mapId;
+    return entry;
+}
+
+void DungeonMasterMgr::SetBestiaryMetaBossEncountered(uint32 guidLow, uint32 mapId)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto& entry = _playerBestiaryMeta[guidLow][mapId];
+    entry.Guid = guidLow;
+    entry.MapId = mapId;
+    entry.BossEncountered = true;
+}
+
+void DungeonMasterMgr::SetBestiaryMetaBossBeaten(uint32 guidLow, uint32 mapId)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto& entry = _playerBestiaryMeta[guidLow][mapId];
+    entry.Guid = guidLow;
+    entry.MapId = mapId;
+    entry.BossBeaten = true;
+}
+
+void DungeonMasterMgr::IncrementBestiaryMetaKills(uint32 guidLow, uint32 mapId, uint32 amount)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto& entry = _playerBestiaryMeta[guidLow][mapId];
+    entry.Guid = guidLow;
+    entry.MapId = mapId;
+    entry.TotalKills += amount;
+}
+
+void DungeonMasterMgr::IncrementBestiaryMetaRunsStarted(uint32 guidLow, uint32 mapId)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto& entry = _playerBestiaryMeta[guidLow][mapId];
+    entry.Guid = guidLow;
+    entry.MapId = mapId;
+    entry.RunsStarted++;
+}
+
+void DungeonMasterMgr::IncrementBestiaryMetaRunsCompleted(uint32 guidLow, uint32 mapId)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto& entry = _playerBestiaryMeta[guidLow][mapId];
+    entry.Guid = guidLow;
+    entry.MapId = mapId;
+    entry.RunsCompleted++;
+}
+
+const std::unordered_map<uint32, std::unordered_map<uint32, uint32>>* DungeonMasterMgr::GetPlayerBestiaryMap(uint32 guidLow) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerBestiary.find(guidLow);
+    if (it != _playerBestiary.end())
+        return &it->second;
+    return nullptr;
+}
+
+const std::unordered_map<uint32, DungeonKnowledgeEntry>* DungeonMasterMgr::GetPlayerBestiaryMetaMap(uint32 guidLow) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerBestiaryMeta.find(guidLow);
+    if (it != _playerBestiaryMeta.end())
+        return &it->second;
+    return nullptr;
+}
+
+const std::unordered_map<uint32, AffixFamiliarityEntry>* DungeonMasterMgr::GetPlayerFamiliarityMap(uint32 guidLow) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerFamiliarity.find(guidLow);
+    if (it != _playerFamiliarity.end())
+        return &it->second;
+    return nullptr;
+}
+
+AffixFamiliarityEntry DungeonMasterMgr::GetAffixFamiliarity(uint32 guidLow, uint32 affixId) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerFamiliarity.find(guidLow);
+    if (it != _playerFamiliarity.end())
+    {
+        auto it2 = it->second.find(affixId);
+        if (it2 != it->second.end())
+            return it2->second;
+    }
+    AffixFamiliarityEntry entry;
+    entry.Guid = guidLow;
+    entry.AffixId = affixId;
+    return entry;
+}
+
+void DungeonMasterMgr::IncrementAffixFamiliarityEncounters(uint32 guidLow, uint32 affixId)
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto& entry = _playerFamiliarity[guidLow][affixId];
+    entry.Guid = guidLow;
+    entry.AffixId = affixId;
+    entry.Encounters++;
+    
+    // Compute new resistance: resistance = min(MaxFamiliarityPct, encounters * FamiliarityPerEncounter)
+    float maxPct = sDMConfig->GetRoguelikeMaxFamiliarityPct();
+    float perEnc = sDMConfig->GetRoguelikeFamiliarityPerEncounter();
+    entry.ResistancePct = std::min(maxPct, entry.Encounters * perEnc);
+}
+
+bool DungeonMasterMgr::HasMasteryPerk(uint32 guidLow, uint32 perkId) const
+{
+    std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+    auto it = _playerMastery.find(guidLow);
+    if (it != _playerMastery.end())
+    {
+        return (it->second.PurchasedMask & (1 << perkId)) != 0;
+    }
+    return false;
+}
+
+void DungeonMasterMgr::EarnMasteryPoint(Player* player)
+{
+    if (!player)
+        return;
+
+    uint32 guidLow = player->GetGUID().GetCounter();
+    {
+        std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+        auto& mastery = _playerMastery[guidLow];
+        mastery.Guid = guidLow;
+        mastery.MasteryPoints++;
+    }
+
+    SavePlayerDungeonData(guidLow);
+
+    if (player->GetSession())
+    {
+        ChatHandler(player->GetSession()).SendNotification("You earned a Dungeon Challenge Mastery Point!");
+        ChatHandler(player->GetSession()).SendSysMessage("|cFF00FF00[Dungeon Master]|r You earned a Dungeon Challenge Mastery Point!");
+    }
+
+    SendPlayerMastery(player);
+}
+
+bool DungeonMasterMgr::BuyMasteryPerk(uint32 guidLow, uint32 perkId)
+{
+    // Perk costs: Scout = 1, Veteran = 2, Pathfinder = 3, Gladiator = 4, Survivor = 5
+    uint32 cost = perkId + 1;
+
+    bool success = false;
+    {
+        std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+        auto it = _playerMastery.find(guidLow);
+        if (it != _playerMastery.end())
+        {
+            // Check if already purchased and cost
+            if (!(it->second.PurchasedMask & (1 << perkId)) && it->second.MasteryPoints >= cost)
+            {
+                it->second.MasteryPoints -= cost;
+                it->second.PurchasedMask |= (1 << perkId);
+                success = true;
+            }
+        }
+    }
+
+    if (success)
+    {
+        SavePlayerDungeonData(guidLow);
+        return true;
+    }
+    return false;
+}
+
+void DungeonMasterMgr::SendPlayerMastery(Player* player) const
+{
+    if (!player || !player->GetSession())
+        return;
+
+    uint32 guidLow = player->GetGUID().GetCounter();
+    uint32 points = 0;
+    uint32 mask = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+        auto it = _playerMastery.find(guidLow);
+        if (it != _playerMastery.end())
+        {
+            points = it->second.MasteryPoints;
+            mask = it->second.PurchasedMask;
+        }
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "DMDATA:MASTERY:%u,%u", points, mask);
+    ChatHandler(player->GetSession()).SendSysMessage(buf);
+}
+
+void DungeonMasterMgr::SendPlayerPersonalBests(Player* player) const
+{
+    if (!player || !player->GetSession())
+        return;
+
+    uint32 guidLow = player->GetGUID().GetCounter();
+
+    {
+        std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+        auto it = _playerPersonalBests.find(guidLow);
+        if (it != _playerPersonalBests.end())
+        {
+            for (const auto& [mapId, innerMap] : it->second)
+            {
+                for (const auto& [diffId, clearTime] : innerMap)
+                {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "DMDATA:PBEST:%u,%u,%u", mapId, diffId, clearTime);
+                    ChatHandler(player->GetSession()).SendSysMessage(buf);
+                }
+            }
+        }
+    }
+}
+
+void DungeonMasterMgr::UpdatePersonalBest(Player* player, uint32 mapId, uint32 difficultyId, uint32 clearTime)
+{
+    if (!player)
+        return;
+
+    uint32 guidLow = player->GetGUID().GetCounter();
+    bool isNewPB = false;
+    uint32 oldTime = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(_dungeonDataMutex);
+        auto& currentPB = _playerPersonalBests[guidLow][mapId][difficultyId];
+        if (currentPB == 0 || clearTime < currentPB)
+        {
+            isNewPB = true;
+            oldTime = currentPB;
+            currentPB = clearTime;
+        }
+    }
+
+    if (isNewPB)
+    {
+        SavePlayerDungeonData(guidLow);
+        SendPlayerPersonalBests(player);
+
+        if (player->GetSession())
+        {
+            char msg[256];
+            uint32 minutes = clearTime / 60;
+            uint32 seconds = clearTime % 60;
+            if (oldTime == 0)
+            {
+                snprintf(msg, sizeof(msg), "|cFF00FF00[Dungeon Master]|r New Personal Best! Clear Time: %u:%02u", minutes, seconds);
+            }
+            else
+            {
+                int diff = oldTime - clearTime;
+                uint32 diffMin = diff / 60;
+                uint32 diffSec = diff % 60;
+                snprintf(msg, sizeof(msg), "|cFF00FF00[Dungeon Master]|r New Personal Best! Clear Time: %u:%02u (Improved by %u:%02u!)", minutes, seconds, diffMin, diffSec);
+            }
+            ChatHandler(player->GetSession()).SendSysMessage(msg);
+        }
+    }
 }
 
 } // namespace DungeonMaster

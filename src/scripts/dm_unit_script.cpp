@@ -4,6 +4,11 @@
  *   - Session boss spells/melee: scaled by level ratio (template level → session level)
  *   - Session trash: already scaled by custom AI melee, passed through
  *   - Environmental (non-session): capped at 3% max HP
+ *
+ * Modified to implement:
+ *   - Stacking Wipe Debuff ("Dungeon Weakness") and Survival Buff ("Dungeon Attunement") scaling.
+ *   - Mob attunement/adaptation scaling.
+ *   - Support for NPCBots and another player.
  */
 
 #include "ScriptMgr.h"
@@ -12,6 +17,8 @@
 #include "SpellInfo.h"
 #include "DungeonMasterMgr.h"
 #include "DMConfig.h"
+#include "botmgr.h"
+#include "bot_ai.h"
 
 using namespace DungeonMaster;
 
@@ -40,6 +47,30 @@ public:
         ScaleDamage(target, attacker, damage);
     }
 
+    void OnHeal(Unit* healer, Unit* /*reciever*/, uint32& gain) override
+    {
+        if (!sDMConfig->IsEnabled() || gain == 0)
+            return;
+
+        Session* session = GetDMPlayerSession(healer);
+        if (session && session->IsActive())
+        {
+            float healMult = 1.0f;
+            // Apply Wipe Debuff (damage/healing dealt reduced by 15% per stack)
+            if (session->WipeDebuffTimer > 0 && session->WipeDebuffStacks > 0)
+            {
+                healMult -= 0.15f * session->WipeDebuffStacks;
+            }
+            // Apply Survival Buff (damage/healing dealt increased by 10% per stack)
+            if (session->SurvivalBuffStacks > 0)
+            {
+                healMult += 0.10f * session->SurvivalBuffStacks;
+            }
+            healMult = std::max(0.1f, healMult);
+            gain = static_cast<uint32>(gain * healMult);
+        }
+    }
+
     void OnUnitDeath(Unit* unit, Unit* killer) override
     {
         if (!sDMConfig->IsEnabled() || !unit)
@@ -49,6 +80,28 @@ public:
         if (!creature)
             return;
 
+        // Check if the deceased creature is an NPCBot
+        if (creature->IsNPCBot())
+        {
+            if (bot_ai* ai = creature->GetBotAI())
+            {
+                Player* master = ai->GetBotOwner();
+                if (master)
+                {
+                    Session* session = sDungeonMasterMgr->GetSessionByPlayer(master->GetGUID());
+                    if (session && session->IsActive() && creature->GetMapId() == session->MapId)
+                    {
+                        if (session->IsPartyWiped())
+                        {
+                            sDungeonMasterMgr->HandlePlayerDeath(master, session);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Original logic for dungeon mobs/bosses
         Player* player = nullptr;
         if (killer)
         {
@@ -71,50 +124,151 @@ public:
     }
 
 private:
+    Player* GetAssociatedPlayer(Unit* unit)
+    {
+        if (!unit)
+            return nullptr;
+
+        Player* p = unit->ToPlayer();
+        if (!p && unit->GetTypeId() == TYPEID_UNIT && unit->ToCreature()->IsNPCBot())
+        {
+            if (bot_ai* ai = unit->ToCreature()->GetBotAI())
+                p = ai->GetBotOwner();
+        }
+        return p;
+    }
+
+    Session* GetDMPlayerSession(Unit* unit)
+    {
+        if (!unit)
+            return nullptr;
+
+        Player* p = unit->ToPlayer();
+        if (!p && unit->GetTypeId() == TYPEID_UNIT && unit->ToCreature()->IsNPCBot())
+        {
+            if (bot_ai* ai = unit->ToCreature()->GetBotAI())
+                p = ai->GetBotOwner();
+        }
+
+        if (p)
+            return sDungeonMasterMgr->GetSessionByPlayer(p->GetGUID());
+
+        return nullptr;
+    }
+
     void ScaleDamage(Unit* target, Unit* attacker, uint32& damage)
     {
         if (!sDMConfig->IsEnabled() || damage == 0)
             return;
 
-        Player* player = target ? target->ToPlayer() : nullptr;
-        if (!player)
-            return;
+        Session* targetSession = GetDMPlayerSession(target);
+        Session* attackerSession = GetDMPlayerSession(attacker);
 
-        if (attacker && attacker->ToPlayer())
-            return;
-
-        ObjectGuid playerGuid = player->GetGUID();
-
-        if (!sDungeonMasterMgr->GetSessionByPlayer(playerGuid))
-            return;
-
-        if (attacker)
+        // --- Outgoing damage from Player/Bot (Attacker) ---
+        if (attackerSession && attackerSession->IsActive())
         {
-            ObjectGuid attackerGuid = attacker->GetGUID();
-
-            // Session creature damage — scale bosses, pass through trash
-            if (sDungeonMasterMgr->IsSessionCreature(playerGuid, attackerGuid))
+            float dmgMult = 1.0f;
+            // Gladiator perk (bit 3): +5% damage dealt
+            if (Player* attPlayer = GetAssociatedPlayer(attacker))
             {
-                float scale = sDungeonMasterMgr->GetSessionCreatureDamageScale(
-                    playerGuid, attackerGuid);
+                if (sDungeonMasterMgr->HasMasteryPerk(attPlayer->GetGUID().GetCounter(), 3))
+                {
+                    dmgMult += 0.05f;
+                }
+            }
 
-                if (scale < 1.0f)
-                    damage = std::max(1u, static_cast<uint32>(damage * scale));
+            // Apply Wipe Debuff Penalty (damage dealt reduced by 15% per stack)
+            if (attackerSession->WipeDebuffTimer > 0 && attackerSession->WipeDebuffStacks > 0)
+            {
+                dmgMult -= 0.15f * attackerSession->WipeDebuffStacks;
+            }
+            // Apply Survival Buff Bonus (damage dealt increased by 10% per stack)
+            if (attackerSession->SurvivalBuffStacks > 0)
+            {
+                dmgMult += 0.10f * attackerSession->SurvivalBuffStacks;
+            }
+            dmgMult = std::max(0.1f, dmgMult);
+            damage = static_cast<uint32>(damage * dmgMult);
 
-                return;
+            if (attackerSession->GambitGlassCannon)
+            {
+                damage = static_cast<uint32>(damage * 1.5f);
+            }
+
+            // Mobs adapt: if attacker is player/bot and target is a mob,
+            // they effectively have more health, meaning they take less damage.
+            if (!targetSession)
+            {
+                if (attackerSession->SurvivalBuffStacks > 0)
+                {
+                    float hpAdaptScale = 1.0f / (1.0f + 0.04f * attackerSession->SurvivalBuffStacks);
+                    damage = static_cast<uint32>(damage * hpAdaptScale);
+                }
             }
         }
 
-        // Non-session attacker (environmental hazards, traps, etc.)
-        float envScale = sDungeonMasterMgr->GetEnvironmentalDamageScale(playerGuid);
-        if (envScale < 1.0f)
-            damage = static_cast<uint32>(damage * envScale);
+        // --- Incoming damage to Player/Bot (Target) ---
+        if (targetSession && targetSession->IsActive())
+        {
+            float targetDmgMult = 1.0f;
+            // Veteran perk (bit 1): -5% damage taken
+            if (Player* tgtPlayer = GetAssociatedPlayer(target))
+            {
+                if (sDungeonMasterMgr->HasMasteryPerk(tgtPlayer->GetGUID().GetCounter(), 1))
+                {
+                    targetDmgMult -= 0.05f;
+                }
+            }
+            damage = static_cast<uint32>(damage * targetDmgMult);
 
-        uint32 maxHp = player->GetMaxHealth();
-        uint32 cap   = std::max(1u, static_cast<uint32>(maxHp * ENV_DAMAGE_MAX_PCT));
+            if (targetSession->GambitGlassCannon)
+            {
+                damage = static_cast<uint32>(damage * 1.5f);
+            }
 
-        if (damage > cap)
-            damage = cap;
+            if (!attackerSession) // Attacker is a dungeon monster or hazard
+            {
+                if (attacker)
+                {
+                    // For GUID checks, use the session leader
+                    ObjectGuid targetGuid = target->IsPlayer() ? target->GetGUID() : targetSession->LeaderGuid;
+                    ObjectGuid attackerGuid = attacker->GetGUID();
+
+                    if (sDungeonMasterMgr->IsSessionCreature(targetGuid, attackerGuid))
+                    {
+                        float scale = sDungeonMasterMgr->GetSessionCreatureDamageScale(targetGuid, attackerGuid);
+                        if (scale < 1.0f)
+                            damage = std::max(1u, static_cast<uint32>(damage * scale));
+                    }
+                    else
+                    {
+                        // Env damage cap
+                        float envScale = sDungeonMasterMgr->GetEnvironmentalDamageScale(targetGuid);
+                        if (envScale < 1.0f)
+                            damage = static_cast<uint32>(damage * envScale);
+
+                        uint32 maxHp = target->GetMaxHealth();
+                        uint32 cap = std::max(1u, static_cast<uint32>(maxHp * ENV_DAMAGE_MAX_PCT));
+                        if (damage > cap)
+                            damage = cap;
+                    }
+                }
+
+                // Mobs adapt: they deal +4% damage per stack of Attunement
+                if (targetSession->SurvivalBuffStacks > 0)
+                {
+                    float mobDmgMult = 1.0f + (0.04f * targetSession->SurvivalBuffStacks);
+                    damage = static_cast<uint32>(damage * mobDmgMult);
+                }
+
+                // Apply Wipe Debuff Penalty (damage taken increased by 15% per stack)
+                if (targetSession->WipeDebuffTimer > 0 && targetSession->WipeDebuffStacks > 0)
+                {
+                    float takenMult = 1.0f + (0.15f * targetSession->WipeDebuffStacks);
+                    damage = static_cast<uint32>(damage * takenMult);
+                }
+            }
+        }
 
         if (damage == 0)
             damage = 1;

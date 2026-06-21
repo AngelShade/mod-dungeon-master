@@ -144,16 +144,33 @@ bool RoguelikeMgr::StartRun(Player* leader, uint32 difficultyId, uint32 themeId,
         return false;
     }
 
-    // Check: cooldown
-    if (sDungeonMasterMgr->IsOnCooldown(leader->GetGUID()))
+    std::vector<Player*> members;
+    if (Group* g = leader->GetGroup())
     {
-        uint32 rem = sDungeonMasterMgr->GetRemainingCooldown(leader->GetGUID());
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-            "|cFFFF0000[Roguelike]|r Wait |cFFFFFFFF%u|r min |cFFFFFFFF%u|r sec before starting.",
-            rem / 60, rem % 60);
-        ChatHandler(leader->GetSession()).SendSysMessage(buf);
-        return false;
+        for (GroupReference* ref = g->GetFirstMember(); ref; ref = ref->next())
+        {
+            if (Player* m = ref->GetSource())
+                members.push_back(m);
+        }
+    }
+    else
+    {
+        members.push_back(leader);
+    }
+
+    // Check: cooldown
+    for (Player* member : members)
+    {
+        if (sDungeonMasterMgr->IsOnCooldown(member->GetGUID()))
+        {
+            uint32 rem = sDungeonMasterMgr->GetRemainingCooldown(member->GetGUID());
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                "|cFFFF0000[Roguelike]|r Player %s must wait %u min %u sec before starting.",
+                member->GetName().c_str(), rem / 60, rem % 60);
+            ChatHandler(leader->GetSession()).SendSysMessage(buf);
+            return false;
+        }
     }
 
     // Check: can create a session
@@ -162,6 +179,32 @@ bool RoguelikeMgr::StartRun(Player* leader, uint32 difficultyId, uint32 themeId,
         ChatHandler(leader->GetSession()).SendSysMessage(
             "|cFFFF0000[Roguelike]|r Too many active challenges. Try again later.");
         return false;
+    }
+
+    // Use the difficulty selected by the player (or fall back to first available)
+    const DifficultyTier* diff = sDMConfig->GetDifficulty(difficultyId);
+    uint32 finalDifficultyId = difficultyId;
+    if (!diff)
+    {
+        const auto& diffs = sDMConfig->GetDifficulties();
+        finalDifficultyId = diffs.empty() ? 1 : diffs[0].Id;
+        diff = sDMConfig->GetDifficulty(finalDifficultyId);
+    }
+
+    if (diff)
+    {
+        for (Player* member : members)
+        {
+            if (!diff->IsValidForLevel(member->GetLevel()))
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "|cFFFF0000[Roguelike]|r Player %s does not meet the level requirement (%u) for this difficulty.",
+                    member->GetName().c_str(), diff->MinLevel);
+                ChatHandler(leader->GetSession()).SendSysMessage(buf);
+                return false;
+            }
+        }
     }
 
     // Build the run
@@ -176,15 +219,7 @@ bool RoguelikeMgr::StartRun(Player* leader, uint32 difficultyId, uint32 themeId,
     run.ScaleToParty   = scaleToParty;
     run.CurrentTier    = 1;
     run.RunStartTime   = GameTime::GetGameTime().count();
-
-    // Use the difficulty selected by the player (or fall back to first available)
-    run.BaseDifficultyId = difficultyId;
-    const DifficultyTier* diff = sDMConfig->GetDifficulty(difficultyId);
-    if (!diff)
-    {
-        const auto& diffs = sDMConfig->GetDifficulties();
-        run.BaseDifficultyId = diffs.empty() ? 1 : diffs[0].Id;
-    }
+    run.BaseDifficultyId = finalDifficultyId;
 
     // Store original positions for ALL party members
     RoguelikePlayerData ld;
@@ -217,52 +252,13 @@ bool RoguelikeMgr::StartRun(Player* leader, uint32 difficultyId, uint32 themeId,
         }
     }
 
-    // Select the first dungeon
-    uint32 mapId = SelectRandomDungeon(run);
-    if (!mapId)
-    {
-        ChatHandler(leader->GetSession()).SendSysMessage(
-            "|cFFFF0000[Roguelike]|r No dungeons available for your level!");
-        return false;
-    }
-
     // Clear cooldowns for all party members so they can enter
     for (const auto& pd : run.Players)
         sDungeonMasterMgr->ClearCooldown(pd.PlayerGuid);
 
-    // Create the DM session with the player's scaling choice
-    Session* session = sDungeonMasterMgr->CreateSession(
-        leader, run.BaseDifficultyId, themeId, mapId, run.ScaleToParty);
-    if (!session)
-    {
-        ChatHandler(leader->GetSession()).SendSysMessage(
-            "|cFFFF0000[Roguelike]|r Failed to create dungeon session!");
-        return false;
-    }
-
-    // Tag the session as roguelike
-    session->RoguelikeRunId = run.RunId;
-    run.CurrentSessionId    = session->SessionId;
-
-    // Start the dungeon
-    if (!sDungeonMasterMgr->StartDungeon(session))
-    {
-        ChatHandler(leader->GetSession()).SendSysMessage(
-            "|cFFFF0000[Roguelike]|r Failed to initialize dungeon!");
-        sDungeonMasterMgr->CleanupRoguelikeSession(session->SessionId, false);
-        return false;
-    }
-
-    if (!sDungeonMasterMgr->TeleportPartyIn(session))
-    {
-        ChatHandler(leader->GetSession()).SendSysMessage(
-            "|cFFFF0000[Roguelike]|r Teleport failed!");
-        sDungeonMasterMgr->CleanupRoguelikeSession(session->SessionId, false);
-        return false;
-    }
-
     // No buff on tier 1 — first +10% earned after clearing floor 1
     run.BuffStacks = 0;
+    run.Wipes = 0;
 
     // Grace period for async teleport
     run.TransitionStartTime = GameTime::GetGameTime().count();
@@ -270,11 +266,19 @@ bool RoguelikeMgr::StartRun(Player* leader, uint32 difficultyId, uint32 themeId,
     // Select affixes for tier 1 (may be none if affix start tier > 1)
     SelectAffixesForTier(run);
 
+    // Generate branching options for the first floor
+    GenerateBranchChoices(run);
+    if (run.BranchChoices.empty())
+    {
+        ChatHandler(leader->GetSession()).SendSysMessage(
+            "|cFFFF0000[Roguelike]|r No dungeons available for your level!");
+        return false;
+    }
+
     // Register the run
     {
         std::lock_guard<std::mutex> lock(_runMutex);
         _activeRuns[run.RunId] = run;
-        _sessionToRun[run.CurrentSessionId] = run.RunId;
         for (const auto& pd : run.Players)
             _playerToRun[pd.PlayerGuid] = run.RunId;
     }
@@ -292,27 +296,80 @@ bool RoguelikeMgr::StartRun(Player* leader, uint32 difficultyId, uint32 themeId,
         if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
             ChatHandler(p->GetSession()).SendSysMessage(buf);
 
-    // Announce active affixes if any are present at tier 1
-    if (!run.ActiveAffixes.empty())
+    // Send the first floor branching choices immediately!
+    SendBranchChoicesToParty(run);
+
+    LOG_INFO("module", "RoguelikeMgr: Run {} started (awaiting branch choice) — leader {}, party {}, theme {}",
+        run.RunId, leader->GetName(), run.Players.size(),
+        theme ? theme->Name.c_str() : "Random");
+
+    return true;
+}
+
+
+void RoguelikeMgr::FinalizeCompletedFloor(uint32 runId)
+{
+    RoguelikeRun* run = nullptr;
     {
-        std::string affixNames = GetActiveAffixNames(run.RunId);
-        if (!affixNames.empty())
+        std::lock_guard<std::mutex> lock(_runMutex);
+        auto it = _activeRuns.find(runId);
+        if (it == _activeRuns.end()) return;
+        run = &it->second;
+    }
+
+    uint32 sessionId = run->CurrentSessionId;
+    if (sessionId == 0)
+        return;
+
+    // Copy data before cleanup invalidates the session
+    uint32 sessionMobsKilled   = 0;
+    uint32 sessionBossesKilled = 0;
+    uint32 sessionDeaths       = 0;
+    uint32 sessionDungeonIndex = 0;
+    {
+        Session* session = sDungeonMasterMgr->GetSession(sessionId);
+        if (session)
         {
-            char affixBuf[512];
-            snprintf(affixBuf, sizeof(affixBuf),
-                "|cFF00FFFF[Roguelike]|r Active affixes: %s",
-                affixNames.c_str());
-            for (const auto& pd : run.Players)
-                if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
-                    ChatHandler(p->GetSession()).SendSysMessage(affixBuf);
+            if (session->State != SessionState::Completed)
+                return;
+
+            sessionMobsKilled   = session->MobsKilled;
+            sessionBossesKilled = session->BossesKilled;
+            sessionDungeonIndex = session->DungeonIndex;
+            for (const auto& pd : session->Players)
+                sessionDeaths += pd.Deaths;
+
+            run->SurvivalBuffStacks = session->SurvivalBuffStacks;
+            run->WipeDebuffStacks   = session->WipeDebuffStacks;
+            run->WipeDebuffTimer    = session->WipeDebuffTimer;
+
+            // Distribute per-floor rewards while session pointer is still valid
+            sDungeonMasterMgr->DistributeRewards(session);
+        }
+        else
+        {
+            return;
         }
     }
 
-    LOG_INFO("module", "RoguelikeMgr: Run {} started — leader {}, party {}, theme {}, map {}",
-        run.RunId, leader->GetName(), run.Players.size(),
-        theme ? theme->Name.c_str() : "Random", mapId);
+    // Accumulate stats
+    run->TotalMobsKilled   += sessionMobsKilled;
+    run->TotalBossesKilled += sessionBossesKilled;
+    run->TotalDeaths       += sessionDeaths;
 
-    return true;
+    ++run->DungeonsCleared;
+    run->PreviousDungeonIndex = sessionDungeonIndex;
+
+    // Clean up the DM session (no teleport, no cooldown)
+    sDungeonMasterMgr->CleanupRoguelikeSession(sessionId, true);
+
+    // Remove old session mapping
+    {
+        std::lock_guard<std::mutex> lock(_runMutex);
+        _sessionToRun.erase(sessionId);
+    }
+
+    run->CurrentSessionId = 0;
 }
 
 
@@ -338,6 +395,7 @@ void RoguelikeMgr::OnDungeonCompleted(uint32 runId, uint32 sessionId)
     uint32 sessionBossesKilled = 0;
     uint32 sessionDeaths       = 0;
     uint32 sessionMapId        = 0;
+    uint32 sessionDungeonIndex = 0;
     {
         Session* session = sDungeonMasterMgr->GetSession(sessionId);
         if (session)
@@ -345,8 +403,13 @@ void RoguelikeMgr::OnDungeonCompleted(uint32 runId, uint32 sessionId)
             sessionMobsKilled   = session->MobsKilled;
             sessionBossesKilled = session->BossesKilled;
             sessionMapId        = session->MapId;
+            sessionDungeonIndex = session->DungeonIndex;
             for (const auto& pd : session->Players)
                 sessionDeaths += pd.Deaths;
+
+            run->SurvivalBuffStacks = session->SurvivalBuffStacks;
+            run->WipeDebuffStacks   = session->WipeDebuffStacks;
+            run->WipeDebuffTimer    = session->WipeDebuffTimer;
 
             // Distribute per-floor rewards while session pointer is still valid
             sDungeonMasterMgr->DistributeRewards(session);
@@ -358,8 +421,84 @@ void RoguelikeMgr::OnDungeonCompleted(uint32 runId, uint32 sessionId)
     run->TotalBossesKilled += sessionBossesKilled;
     run->TotalDeaths       += sessionDeaths;
 
+    // Increment runs_completed in bestiary meta
+    if (sDMConfig->IsBestiaryEnabled())
+    {
+        for (const auto& pd : run->Players)
+        {
+            uint32 guidLow = pd.PlayerGuid.GetCounter();
+            sDungeonMasterMgr->IncrementBestiaryMetaRunsCompleted(guidLow, sessionMapId);
+            sDungeonMasterMgr->SavePlayerDungeonData(guidLow);
+        }
+    }
+
+    // Phase 1: Increment familiarity encounters and update known affix mask
+    for (const auto& pd : run->Players)
+    {
+        uint32 guidLow = pd.PlayerGuid.GetCounter();
+        for (RoguelikeAffix afxId : run->ActiveAffixes)
+        {
+            sDungeonMasterMgr->IncrementAffixFamiliarityEncounters(guidLow, afxId);
+            
+            // Update known affix mask in RoguelikePlayerStats
+            {
+                std::lock_guard<std::mutex> lock(_rlStatsMutex);
+                auto& ps = _roguelikeStats[guidLow];
+                ps.KnownAffixMask |= (1 << afxId);
+            }
+        }
+
+        // Update TotalFloorsCleared and handle Veto Token earning
+        {
+            std::lock_guard<std::mutex> lock(_rlStatsMutex);
+            auto& ps = _roguelikeStats[guidLow];
+            ps.TotalFloorsCleared++;
+
+            if (run->CurrentTier >= sDMConfig->GetRoguelikeVetoUnlockTier())
+            {
+                if (ps.TotalFloorsCleared % sDMConfig->GetRoguelikeFloorsPerVeto() == 0)
+                {
+                    if (ps.VetoTokens < sDMConfig->GetRoguelikeMaxVetoTokens())
+                    {
+                        ps.VetoTokens++;
+                        Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+                        if (p && p->GetSession())
+                        {
+                            char announceBuf[256];
+                            snprintf(announceBuf, sizeof(announceBuf),
+                                "|cFF00FFFF[Roguelike]|r You earned a |cFFFFD700Veto Token|r! Remaining: |cFFFFFFFF%u/%u|r",
+                                ps.VetoTokens, sDMConfig->GetRoguelikeMaxVetoTokens());
+                            ChatHandler(p->GetSession()).SendSysMessage(announceBuf);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Save the bestiary/familiarity data
+        sDungeonMasterMgr->SavePlayerDungeonData(guidLow);
+
+        // Save RoguelikePlayerStats to DB immediately
+        RoguelikePlayerStats ps;
+        {
+            std::lock_guard<std::mutex> lock(_rlStatsMutex);
+            ps = _roguelikeStats[guidLow];
+        }
+        char query[512];
+        snprintf(query, sizeof(query),
+            "REPLACE INTO dm_roguelike_player_stats "
+            "(guid, total_runs, highest_tier, most_floors_cleared, "
+            "total_floors_cleared, total_mobs_killed, total_bosses_killed, "
+            "total_deaths, longest_run_time, known_affix_mask, veto_tokens) "
+            "VALUES (%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u)",
+            guidLow, ps.TotalRuns, ps.HighestTier, ps.MostFloorsCleared,
+            ps.TotalFloorsCleared, ps.TotalMobsKilled, ps.TotalBossesKilled,
+            ps.TotalDeaths, ps.LongestRunTime, ps.KnownAffixMask, ps.VetoTokens);
+        CharacterDatabase.Execute(query);
+    }
+
     ++run->DungeonsCleared;
-    run->PreviousMapId = sessionMapId;
+    run->PreviousDungeonIndex = sessionDungeonIndex;
 
     // Clean up the DM session (no teleport, no cooldown)
     sDungeonMasterMgr->CleanupRoguelikeSession(sessionId, true);
@@ -411,10 +550,11 @@ void RoguelikeMgr::OnDungeonCompleted(uint32 runId, uint32 sessionId)
     // Grace period for abandoned detection
     run->TransitionStartTime = GameTime::GetGameTime().count();
 
-    // Transition to the next dungeon
-    if (!TransitionToNextDungeon(*run))
+    // Generate branching options and wait for leader selection
+    GenerateBranchChoices(*run);
+    if (run->BranchChoices.empty())
     {
-        // Failed to create next dungeon — end the run gracefully
+        // Failed to find next dungeons — end the run gracefully
         char failBuf[256];
         snprintf(failBuf, sizeof(failBuf),
             "|cFFFF0000[Roguelike]|r No more dungeons available! "
@@ -422,6 +562,10 @@ void RoguelikeMgr::OnDungeonCompleted(uint32 runId, uint32 sessionId)
             run->CurrentTier, run->DungeonsCleared);
         AnnounceToRun(*run, failBuf);
         EndRun(run->RunId, true);
+    }
+    else
+    {
+        SendBranchChoicesToParty(*run);
     }
 }
 
@@ -492,6 +636,16 @@ void RoguelikeMgr::OnPartyWipe(uint32 runId)
             RemoveBuffStacks(p, run->RunId);
     }
 
+    bool entered = (run->DungeonsCleared > 0);
+    if (!entered && run->CurrentSessionId != 0)
+    {
+        if (Session* s = sDungeonMasterMgr->GetSession(run->CurrentSessionId))
+        {
+            if (s->InstanceId != 0)
+                entered = true;
+        }
+    }
+
     // Clean up the DM session
     if (run->CurrentSessionId != 0)
         sDungeonMasterMgr->CleanupRoguelikeSession(run->CurrentSessionId, false);
@@ -500,13 +654,20 @@ void RoguelikeMgr::OnPartyWipe(uint32 runId)
     TeleportRunPlayersOut(*run);
 
     // Set cooldowns
-    for (const auto& pd : run->Players)
-        sDungeonMasterMgr->SetCooldown(pd.PlayerGuid);
+    if (entered)
+    {
+        for (const auto& pd : run->Players)
+            sDungeonMasterMgr->SetCooldown(pd.PlayerGuid);
+    }
 
     // Save before erase invalidates the pointer
     uint32 savedTier    = run->CurrentTier;
     uint32 savedCleared = run->DungeonsCleared;
     uint32 savedSessId  = run->CurrentSessionId;
+
+    std::vector<ObjectGuid> playerGuids;
+    for (const auto& pd : run->Players)
+        playerGuids.push_back(pd.PlayerGuid);
 
     // Clean up run
     {
@@ -517,6 +678,7 @@ void RoguelikeMgr::OnPartyWipe(uint32 runId)
         _activeRuns.erase(runId);
     }
 
+    sDungeonMasterMgr->SendInactiveUpdateToPlayers(playerGuids);
 
     LOG_INFO("module", "RoguelikeMgr: Run {} ended (wipe) — tier {}, {} floors cleared.",
         runId, savedTier, savedCleared);
@@ -593,6 +755,16 @@ void RoguelikeMgr::EndRun(uint32 runId, bool announceResults)
             run->CurrentTier, effectiveLevel, guids);
     }
 
+    bool entered = (run->DungeonsCleared > 0);
+    if (!entered && run->CurrentSessionId != 0)
+    {
+        if (Session* s = sDungeonMasterMgr->GetSession(run->CurrentSessionId))
+        {
+            if (s->InstanceId != 0)
+                entered = true;
+        }
+    }
+
     // Clean up DM session if one is active
     if (run->CurrentSessionId != 0)
         sDungeonMasterMgr->CleanupRoguelikeSession(run->CurrentSessionId, false);
@@ -601,8 +773,15 @@ void RoguelikeMgr::EndRun(uint32 runId, bool announceResults)
     TeleportRunPlayersOut(*run);
 
     // Set cooldowns
+    if (entered)
+    {
+        for (const auto& pd : run->Players)
+            sDungeonMasterMgr->SetCooldown(pd.PlayerGuid);
+    }
+
+    std::vector<ObjectGuid> playerGuids;
     for (const auto& pd : run->Players)
-        sDungeonMasterMgr->SetCooldown(pd.PlayerGuid);
+        playerGuids.push_back(pd.PlayerGuid);
 
     // Save before erase invalidates the pointer
     uint32 savedTier    = run->CurrentTier;
@@ -618,6 +797,7 @@ void RoguelikeMgr::EndRun(uint32 runId, bool announceResults)
         _activeRuns.erase(runId);
     }
 
+    sDungeonMasterMgr->SendInactiveUpdateToPlayers(playerGuids);
 
     LOG_INFO("module", "RoguelikeMgr: Run {} ended (graceful) — tier {}, {} floors.",
         runId, savedTier, savedCleared);
@@ -775,16 +955,50 @@ void RoguelikeMgr::GetAffixMultipliers(
         {
             if (def.Id == afxId)
             {
+                // Calculate average familiarity resistance for the party
+                float totalResistance = 0.0f;
+                uint32 playerOnlineCount = 0;
+                for (const auto& pd : it->second.Players)
+                {
+                    Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
+                    if (p)
+                    {
+                        uint32 guidLow = pd.PlayerGuid.GetCounter();
+                        float playerRes = sDungeonMasterMgr->GetAffixFamiliarity(guidLow, afxId).ResistancePct;
+                        uint32 encounters = sDungeonMasterMgr->GetAffixFamiliarity(guidLow, afxId).Encounters;
+                        float calcRes = std::min(sDMConfig->GetRoguelikeMaxFamiliarityPct(), encounters * sDMConfig->GetRoguelikeFamiliarityPerEncounter());
+                        playerRes = std::max(playerRes, calcRes);
+
+                        totalResistance += playerRes;
+                        playerOnlineCount++;
+                    }
+                }
+                float avgResistance = (playerOnlineCount > 0) ? (totalResistance / playerOnlineCount) : 0.0f;
+                float resistanceFactor = 1.0f - (avgResistance / 100.0f);
+
+                float baseHpMult = 1.0f;
+                float baseDmgMult = 1.0f;
+
                 if (isBoss)
                 {
-                    outHpMult  *= def.BossHpMult;
-                    outDmgMult *= def.BossDmgMult;
+                    baseHpMult = def.BossHpMult;
+                    baseDmgMult = def.BossDmgMult;
                 }
                 else
                 {
-                    outHpMult  *= def.TrashHpMult;
-                    outDmgMult *= def.TrashDmgMult;
+                    baseHpMult = def.TrashHpMult;
+                    baseDmgMult = def.TrashDmgMult;
                 }
+
+                // Apply resistance factor to the multiplier increases
+                float hpIncrease = baseHpMult - 1.0f;
+                float dmgIncrease = baseDmgMult - 1.0f;
+
+                float adjustedHpMult = 1.0f + (hpIncrease * resistanceFactor);
+                float adjustedDmgMult = 1.0f + (dmgIncrease * resistanceFactor);
+
+                outHpMult *= adjustedHpMult;
+                outDmgMult *= adjustedDmgMult;
                 outEliteChanceMult *= def.EliteChanceMult;
                 break;
             }
@@ -814,6 +1028,41 @@ std::string RoguelikeMgr::GetActiveAffixNames(uint32 runId) const
             {
                 if (!result.empty()) result += ", ";
                 result += "|cFFFF8800" + def.Name + "|r";
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+std::string RoguelikeMgr::GetActiveAffixNamesForPlayer(uint32 runId, ObjectGuid playerGuid) const
+{
+    std::lock_guard<std::mutex> lock(_runMutex);
+    auto it = _activeRuns.find(runId);
+    if (it == _activeRuns.end()) return "";
+
+    std::string result;
+    RoguelikePlayerStats stats = GetRoguelikePlayerStats(playerGuid);
+    uint32 revealTier = sDMConfig->GetRoguelikeRevealAffixTier();
+
+    for (RoguelikeAffix afxId : it->second.ActiveAffixes)
+    {
+        bool isKnown = (stats.KnownAffixMask & (1 << afxId)) != 0;
+        bool isRevealed = isKnown || (it->second.CurrentTier >= revealTier);
+
+        for (const auto& def : _affixDefs)
+        {
+            if (def.Id == afxId)
+            {
+                if (!result.empty()) result += ", ";
+                if (isRevealed)
+                {
+                    result += "|cFFFF8800" + def.Name + "|r";
+                }
+                else
+                {
+                    result += "|cFF808080???|r";
+                }
                 break;
             }
         }
@@ -927,41 +1176,65 @@ void RoguelikeMgr::SelectAffixesForTier(RoguelikeRun& run)
 uint32 RoguelikeMgr::SelectRandomDungeon(const RoguelikeRun& run) const
 {
     const DifficultyTier* diff = sDMConfig->GetDifficulty(run.BaseDifficultyId);
-    if (!diff)
+    std::vector<const DungeonInfo*> dgs;
+    if (diff)
     {
-        // Fallback: use broadest range
-        auto dgs = sDMConfig->GetDungeonsForLevel(1, 80);
-        if (dgs.empty()) return 0;
-        return dgs[RandInt<size_t>(0, dgs.size() - 1)]->MapId;
+        dgs = sDMConfig->GetDungeonsForLevel(diff->MinLevel, diff->MaxLevel);
+    }
+    else
+    {
+        dgs = sDMConfig->GetDungeonsForLevel(1, 80);
     }
 
-    auto dgs = sDMConfig->GetDungeonsForLevel(diff->MinLevel, diff->MaxLevel);
-    if (dgs.empty()) return 0;
+    if (dgs.empty()) return 0xFFFFFFFF;
+
+    // Filter by player level: every player in the run must meet the dungeon's min level requirement
+    std::vector<const DungeonInfo*> eligible;
+    for (const DungeonInfo* d : dgs)
+    {
+        bool partyEligible = true;
+        for (const auto& pd : run.Players)
+        {
+            if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
+            {
+                if (p->GetLevel() < d->MinLevel)
+                {
+                    partyEligible = false;
+                    break;
+                }
+            }
+        }
+        if (partyEligible)
+        {
+            eligible.push_back(d);
+        }
+    }
+
+    if (eligible.empty()) return 0xFFFFFFFF;
 
     // Try to avoid repeating the same dungeon
-    if (dgs.size() > 1 && run.PreviousMapId != 0)
+    if (eligible.size() > 1 && run.DungeonsCleared > 0)
     {
         std::vector<const DungeonInfo*> filtered;
-        for (const auto* d : dgs)
-            if (d->MapId != run.PreviousMapId)
+        for (const auto* d : eligible)
+            if (d->Index != run.PreviousDungeonIndex)
                 filtered.push_back(d);
 
         if (!filtered.empty())
-            return filtered[RandInt<size_t>(0, filtered.size() - 1)]->MapId;
+            return filtered[RandInt<size_t>(0, filtered.size() - 1)]->Index;
     }
 
-    return dgs[RandInt<size_t>(0, dgs.size() - 1)]->MapId;
+    return eligible[RandInt<size_t>(0, eligible.size() - 1)]->Index;
 }
 
 // Transition between dungeons
 
-bool RoguelikeMgr::TransitionToNextDungeon(RoguelikeRun& run)
+bool RoguelikeMgr::TransitionToNextDungeon(RoguelikeRun& run, uint32 dungeonIndex, uint32 themeId)
 {
-    uint32 mapId = SelectRandomDungeon(run);
-    if (!mapId)
+    const DungeonInfo* dg = sDMConfig->GetDungeon(dungeonIndex);
+    if (!dg)
     {
-        LOG_WARN("module", "RoguelikeMgr: No dungeon available for run {} tier {}",
-            run.RunId, run.CurrentTier);
+        LOG_WARN("module", "RoguelikeMgr: Invalid dungeon index {} for run {}", dungeonIndex, run.RunId);
         return false;
     }
 
@@ -986,24 +1259,35 @@ bool RoguelikeMgr::TransitionToNextDungeon(RoguelikeRun& run)
     for (const auto& pd : run.Players)
         sDungeonMasterMgr->ClearCooldown(pd.PlayerGuid);
 
-    // Select theme: run-locked theme or random
-    uint32 themeId = run.ThemeId;
-    if (themeId == 0)
-    {
-        const auto& themes = sDMConfig->GetThemes();
-        if (!themes.empty())
-            themeId = themes[RandInt<size_t>(0, themes.size() - 1)].Id;
-    }
-
     // Create the new DM session
     Session* session = sDungeonMasterMgr->CreateSession(
-        leader, run.BaseDifficultyId, themeId, mapId, run.ScaleToParty);
+        leader, run.BaseDifficultyId, themeId, dungeonIndex, run.ScaleToParty);
     if (!session)
     {
         LOG_ERROR("module", "RoguelikeMgr: Failed to create session for run {} tier {}",
             run.RunId, run.CurrentTier);
         return false;
     }
+
+    uint32 nextFloor = run.DungeonsCleared + 1;
+    if (nextFloor % 10 == 0)
+    {
+        if (run.Wipes > 0)
+        {
+            --run.Wipes;
+            char recoverMsg[256];
+            snprintf(recoverMsg, sizeof(recoverMsg),
+                "|cFF00FFFF[Roguelike]|r You have reached Floor %u! You gained 1 life back!",
+                nextFloor);
+            AnnounceToRun(run, recoverMsg);
+        }
+    }
+
+    session->SurvivalBuffStacks = run.SurvivalBuffStacks;
+    session->TimeAlive          = run.SurvivalBuffStacks * 300;
+    session->WipeDebuffStacks   = run.WipeDebuffStacks;
+    session->WipeDebuffTimer    = run.WipeDebuffTimer;
+    session->Wipes              = run.Wipes;
 
     // Tag as roguelike
     session->RoguelikeRunId = run.RunId;
@@ -1039,16 +1323,17 @@ bool RoguelikeMgr::TransitionToNextDungeon(RoguelikeRun& run)
     }
 
     run.State = RoguelikeRunState::Active;
+    run.TransitionStartTime = GameTime::GetGameTime().count();
 
-    const DungeonInfo* dg = sDMConfig->GetDungeon(mapId);
+    dg = sDMConfig->GetDungeon(dungeonIndex);
     char buf[256];
     snprintf(buf, sizeof(buf),
         "|cFF00FFFF[Roguelike]|r Entering |cFFFFFFFF%s|r — Tier |cFFFF0000%u|r",
         dg ? dg->Name.c_str() : "Unknown", run.CurrentTier);
     AnnounceToRun(run, buf);
 
-    LOG_INFO("module", "RoguelikeMgr: Run {} transitioned to tier {} — map {} ({})",
-        run.RunId, run.CurrentTier, mapId,
+    LOG_INFO("module", "RoguelikeMgr: Run {} transitioned to tier {} — dungeonIndex {} ({})",
+        run.RunId, run.CurrentTier, dungeonIndex,
         dg ? dg->Name.c_str() : "?");
 
     return true;
@@ -1118,7 +1403,7 @@ void RoguelikeMgr::Update(uint32 diff)
             if (run.TransitionStartTime > 0)
             {
                 uint64 elapsed = GameTime::GetGameTime().count() - run.TransitionStartTime;
-                if (elapsed < 30)
+                if (elapsed < 300)
                     continue;   // still in grace window
                 // Grace expired — clear flag so normal detection resumes
                 run.TransitionStartTime = 0;
@@ -1129,7 +1414,7 @@ void RoguelikeMgr::Update(uint32 diff)
             for (const auto& pd : run.Players)
             {
                 Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid);
-                if (p && p->IsInWorld()) { anyOnline = true; break; }
+                if (p && p->GetSession()) { anyOnline = true; break; }
             }
 
             if (!anyOnline)
@@ -1255,7 +1540,7 @@ void RoguelikeMgr::LoadAllRoguelikePlayerStats()
     QueryResult result = CharacterDatabase.Query(
         "SELECT guid, total_runs, highest_tier, most_floors_cleared, "
         "total_floors_cleared, total_mobs_killed, total_bosses_killed, "
-        "total_deaths, longest_run_time "
+        "total_deaths, longest_run_time, known_affix_mask, veto_tokens "
         "FROM dm_roguelike_player_stats");
 
     if (!result)
@@ -1279,6 +1564,8 @@ void RoguelikeMgr::LoadAllRoguelikePlayerStats()
         ps.TotalBossesKilled  = f[6].Get<uint32>();
         ps.TotalDeaths        = f[7].Get<uint32>();
         ps.LongestRunTime     = f[8].Get<uint32>();
+        ps.KnownAffixMask     = f[9].Get<uint32>();
+        ps.VetoTokens         = f[10].Get<uint32>();
 
         _roguelikeStats[guidLow] = ps;
         ++count;
@@ -1315,7 +1602,7 @@ void RoguelikeMgr::UpdateRoguelikePlayerStats(const RoguelikeRun& run)
                 ps.HighestTier = run.CurrentTier;
             if (run.DungeonsCleared > ps.MostFloorsCleared)
                 ps.MostFloorsCleared = run.DungeonsCleared;
-            ps.TotalFloorsCleared += run.DungeonsCleared;
+            // ps.TotalFloorsCleared is updated per-floor in OnDungeonCompleted
             ps.TotalMobsKilled    += run.TotalMobsKilled;
             ps.TotalBossesKilled  += run.TotalBossesKilled;
             ps.TotalDeaths        += run.TotalDeaths;
@@ -1335,12 +1622,246 @@ void RoguelikeMgr::UpdateRoguelikePlayerStats(const RoguelikeRun& run)
             "REPLACE INTO dm_roguelike_player_stats "
             "(guid, total_runs, highest_tier, most_floors_cleared, "
             "total_floors_cleared, total_mobs_killed, total_bosses_killed, "
-            "total_deaths, longest_run_time) "
-            "VALUES (%u, %u, %u, %u, %u, %u, %u, %u, %u)",
+            "total_deaths, longest_run_time, known_affix_mask, veto_tokens) "
+            "VALUES (%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u)",
             guidLow, ps.TotalRuns, ps.HighestTier, ps.MostFloorsCleared,
             ps.TotalFloorsCleared, ps.TotalMobsKilled, ps.TotalBossesKilled,
-            ps.TotalDeaths, ps.LongestRunTime);
-        CharacterDatabase.Execute(query);
+            ps.TotalDeaths, ps.LongestRunTime, ps.KnownAffixMask, ps.VetoTokens);
+    }
+}
+
+void RoguelikeMgr::GenerateBranchChoices(RoguelikeRun& run)
+{
+    run.BranchChoices.clear();
+    run.AwaitingBranchSelection = true;
+
+    // Get leader low GUID for bestiary and risk lookups
+    uint32 leaderGuidLow = run.LeaderGuid.GetCounter();
+
+    // Get eligible dungeons
+    const DifficultyTier* diff = sDMConfig->GetDifficulty(run.BaseDifficultyId);
+    if (!diff) return;
+
+    auto dgs = sDMConfig->GetDungeonsForLevel(diff->MinLevel, diff->MaxLevel);
+    std::vector<const DungeonInfo*> eligible;
+    for (const DungeonInfo* d : dgs)
+    {
+        bool partyEligible = true;
+        for (const auto& pd : run.Players)
+        {
+            if (Player* p = ObjectAccessor::FindPlayer(pd.PlayerGuid))
+            {
+                if (p->GetLevel() < d->MinLevel)
+                {
+                    partyEligible = false;
+                    break;
+                }
+            }
+        }
+        if (partyEligible)
+            eligible.push_back(d);
+    }
+
+    if (eligible.empty())
+        return;
+
+    // Shuffle/randomly select up to 3 unique dungeons
+    std::vector<const DungeonInfo*> candidates = eligible;
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(candidates.begin(), candidates.end(), g);
+
+    // If possible, filter out previous dungeon
+    if (candidates.size() > 1 && run.DungeonsCleared > 0)
+    {
+        for (auto it = candidates.begin(); it != candidates.end(); ++it)
+        {
+            if ((*it)->Index == run.PreviousDungeonIndex)
+            {
+                candidates.erase(it);
+                break;
+            }
+        }
+    }
+
+    uint32 maxChoices = sDMConfig->GetRoguelikeBranchChoices();
+    if (sDungeonMasterMgr->HasMasteryPerk(leaderGuidLow, 2)) // Pathfinder perk is bit 2
+    {
+        maxChoices = 4;
+    }
+
+    uint32 count = std::min<uint32>(maxChoices, static_cast<uint32>(candidates.size()));
+    if (count == 0 && !eligible.empty())
+    {
+        candidates = eligible;
+        count = 1;
+    }
+
+    for (uint32 i = 0; i < count; ++i)
+    {
+        const DungeonInfo* dg = candidates[i];
+        BranchOption opt;
+        opt.DungeonIndex = dg->Index;
+
+        // Theme selection: run theme if locked, else random theme
+        uint32 themeId = run.ThemeId;
+        if (themeId == 0)
+        {
+            const auto& themes = sDMConfig->GetThemes();
+            if (!themes.empty())
+            {
+                themeId = themes[RandInt<size_t>(0, themes.size() - 1)].Id;
+            }
+        }
+        opt.ThemeId = themeId;
+
+        // Check if theme is known/discovered on this map for the leader
+        const Theme* th = sDMConfig->GetTheme(themeId);
+        bool bestiaryPermits = false;
+        if (th)
+        {
+            DungeonKnowledgeEntry meta = sDungeonMasterMgr->GetBestiaryMeta(leaderGuidLow, dg->MapId);
+            if (meta.RunsCompleted > 0 || meta.TotalKills > 0)
+            {
+                bestiaryPermits = true;
+            }
+            else
+            {
+                for (uint32 ct : th->CreatureTypes)
+                {
+                    if (ct == uint32(-1) || sDungeonMasterMgr->GetBestiaryKills(leaderGuidLow, dg->MapId, ct) > 0)
+                    {
+                        bestiaryPermits = true;
+                        break;
+                    }
+                }
+            }
+        }
+        opt.ThemeDiscovered = bestiaryPermits;
+
+        // Risk level lookup
+        DungeonKnowledgeEntry meta = sDungeonMasterMgr->GetBestiaryMeta(leaderGuidLow, dg->MapId);
+        if (meta.RunsStarted == 0)
+        {
+            opt.Risk = RiskLevel::Unknown;
+        }
+        else
+        {
+            float winRate = static_cast<float>(meta.RunsCompleted) / meta.RunsStarted;
+            if (winRate >= 0.75f)
+                opt.Risk = RiskLevel::Low;
+            else if (winRate >= 0.40f)
+                opt.Risk = RiskLevel::Medium;
+            else
+                opt.Risk = RiskLevel::High;
+        }
+
+        run.BranchChoices.push_back(opt);
+    }
+}
+
+void RoguelikeMgr::SendBranchChoicesToParty(const RoguelikeRun& run)
+{
+    std::string payload = "DMDATA:BRANCH_OPTIONS:";
+    for (size_t i = 0; i < run.BranchChoices.size(); ++i)
+    {
+        if (i > 0) payload += "|";
+        const auto& opt = run.BranchChoices[i];
+        payload += std::to_string(opt.DungeonIndex + 1) + "," +
+                   std::to_string(opt.ThemeDiscovered ? opt.ThemeId : 0) + "," +
+                   std::to_string(static_cast<uint32>(opt.Risk));
+    }
+    
+    AnnounceToRun(run, payload.c_str());
+}
+
+bool RoguelikeMgr::ConsumeVetoToken(ObjectGuid playerGuid)
+{
+    std::lock_guard<std::mutex> lock(_rlStatsMutex);
+    uint32 guidLow = playerGuid.GetCounter();
+    auto it = _roguelikeStats.find(guidLow);
+    if (it == _roguelikeStats.end() || it->second.VetoTokens == 0)
+        return false;
+
+    it->second.VetoTokens--;
+
+    // Persist
+    RoguelikePlayerStats ps = it->second;
+    char query[512];
+    snprintf(query, sizeof(query),
+        "REPLACE INTO dm_roguelike_player_stats "
+        "(guid, total_runs, highest_tier, most_floors_cleared, "
+        "total_floors_cleared, total_mobs_killed, total_bosses_killed, "
+        "total_deaths, longest_run_time, known_affix_mask, veto_tokens) "
+        "VALUES (%u, %u, %u, %u, %u, %u, %u, %u, %u, %u, %u)",
+        guidLow, ps.TotalRuns, ps.HighestTier, ps.MostFloorsCleared,
+        ps.TotalFloorsCleared, ps.TotalMobsKilled, ps.TotalBossesKilled,
+        ps.TotalDeaths, ps.LongestRunTime, ps.KnownAffixMask, ps.VetoTokens);
+    CharacterDatabase.Execute(query);
+    return true;
+}
+
+bool RoguelikeMgr::VetoAffixForRun(uint32 runId, uint32 vetoedAffixId, std::string& outNewAffixName)
+{
+    std::lock_guard<std::mutex> lock(_runMutex);
+    auto it = _activeRuns.find(runId);
+    if (it == _activeRuns.end())
+        return false;
+
+    RoguelikeRun& run = it->second;
+
+    // Find the vetoed affix in currently active affixes
+    auto affIt = std::find(run.ActiveAffixes.begin(), run.ActiveAffixes.end(), static_cast<RoguelikeAffix>(vetoedAffixId));
+    if (affIt == run.ActiveAffixes.end())
+        return false;
+
+    // Remove the vetoed affix
+    run.ActiveAffixes.erase(affIt);
+
+    // Build the remaining pool of affixes (exclude vetoed and currently active)
+    std::vector<RoguelikeAffix> pool;
+    for (const auto& def : _affixDefs)
+    {
+        if (def.Id == AFFIX_NONE || def.Id == static_cast<RoguelikeAffix>(vetoedAffixId))
+            continue;
+
+        if (std::find(run.ActiveAffixes.begin(), run.ActiveAffixes.end(), def.Id) != run.ActiveAffixes.end())
+            continue;
+
+        pool.push_back(def.Id);
+    }
+
+    if (!pool.empty())
+    {
+        std::shuffle(pool.begin(), pool.end(), tRng);
+        RoguelikeAffix newAfx = pool[0];
+        run.ActiveAffixes.push_back(newAfx);
+
+        for (const auto& def : _affixDefs)
+        {
+            if (def.Id == newAfx)
+            {
+                outNewAffixName = def.Name;
+                break;
+            }
+        }
+    }
+    else
+    {
+        outNewAffixName = "None";
+    }
+
+    return true;
+}
+
+void RoguelikeMgr::ClearTransitionTime(uint32 runId)
+{
+    std::lock_guard<std::mutex> lock(_runMutex);
+    auto it = _activeRuns.find(runId);
+    if (it != _activeRuns.end())
+    {
+        it->second.TransitionStartTime = 0;
+        LOG_INFO("module", "RoguelikeMgr: Run {} cleared transition grace period on player map enter.", runId);
     }
 }
 

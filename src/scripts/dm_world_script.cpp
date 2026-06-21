@@ -34,14 +34,26 @@ public:
         // Patch Greater Blessing of Kings (25898) to allow stacking.
         // The base DBC has StackAmount=0 which prevents the client from
         // showing a stack count on the buff icon.  Setting it server-side
-        // to 20 lets SetStackAmount() work and the client renders "2", "3"
+        // to 255 lets SetStackAmount() work and the client renders "2", "3"
         // etc. on the icon during roguelike runs.
-        SpellInfo* bokInfo = const_cast<SpellInfo*>(
-            sSpellMgr->GetSpellInfo(25898));
-        if (bokInfo)
+        if (SpellInfo* bokInfo = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(25898)))
         {
             bokInfo->StackAmount = 255;
-            LOG_INFO("module", "DungeonMaster: Patched BoK (25898) StackAmount → 255 for roguelike buff stacking.");
+            LOG_INFO("module", "DungeonMaster: Patched BoK (25898) StackAmount -> 255 for roguelike buff stacking.");
+        }
+
+        // Patch Spiritual Attunement (31785) to allow stacking.
+        if (SpellInfo* attuneInfo = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(31785)))
+        {
+            attuneInfo->StackAmount = 255;
+            LOG_INFO("module", "DungeonMaster: Patched Spiritual Attunement (31785) StackAmount -> 255 for survival buff stacking.");
+        }
+
+        // Patch Weakened (64162) to allow stacking.
+        if (SpellInfo* weakInfo = const_cast<SpellInfo*>(sSpellMgr->GetSpellInfo(64162)))
+        {
+            weakInfo->StackAmount = 255;
+            LOG_INFO("module", "DungeonMaster: Patched Weakened (64162) StackAmount -> 255 for wipe debuff stacking.");
         }
 
         sDungeonMasterMgr->Initialize();
