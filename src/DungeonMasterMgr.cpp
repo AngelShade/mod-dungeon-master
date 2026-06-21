@@ -2441,8 +2441,8 @@ void DungeonMasterMgr::DistributeRewards(Session* session)
 
     uint32 lvl       = session->EffectiveLevel;
 
-    // Scale gold config values quadratically by level
-    float levelScale = (static_cast<float>(lvl * lvl)) / 400.0f;
+    // Scale gold config values based on expansion brackets
+    float levelScale = GetExpansionGoldMultiplier(lvl);
     uint32 baseGold  = static_cast<uint32>(sDMConfig->GetBaseGold() * levelScale);
     uint32 mobGold   = static_cast<uint32>(sDMConfig->GetGoldPerMob() * session->MobsKilled * levelScale);
     uint32 bossGold  = static_cast<uint32>(sDMConfig->GetGoldPerBoss() * session->BossesKilled * levelScale);
@@ -2815,8 +2815,8 @@ void DungeonMasterMgr::DistributeRoguelikeRewards(uint32 tier, uint8 effectiveLe
 {
     uint8 rewardLevel = static_cast<uint8>(std::min<uint32>(effectiveLevel, 80));
 
-    // Scale gold config values quadratically by level
-    float levelScale = (static_cast<float>(effectiveLevel * effectiveLevel)) / 400.0f;
+    // Scale gold config values based on expansion brackets
+    float levelScale = GetExpansionGoldMultiplier(effectiveLevel);
     uint32 baseGold = static_cast<uint32>(sDMConfig->GetBaseGold() * levelScale);
     uint32 tierGold = baseGold * tier;
 
@@ -5442,6 +5442,33 @@ void DungeonMasterMgr::UpdatePersonalBest(Player* player, uint32 mapId, uint32 d
             ChatHandler(player->GetSession()).SendSysMessage(msg);
         }
     }
+}
+
+float DungeonMasterMgr::GetExpansionGoldMultiplier(uint8 effectiveLevel) const
+{
+    float levelScale = 1.0f;
+    uint32 lvl = effectiveLevel;
+
+    if (lvl <= 60)
+    {
+        // Classic: scale quadratically up to 0.4x of WotLK level 80 max scale
+        // At lvl 60: (60*60)/3600 * 0.4 = 0.4 (giving 2g base gold at lvl 60 based on default 5g base config)
+        levelScale = (static_cast<float>(lvl * lvl) / 3600.0f) * 0.4f;
+    }
+    else if (lvl <= 70)
+    {
+        // TBC: scale quadratically up to 3.0x of WotLK level 80 max scale
+        // At lvl 70: (70*70)/4900 * 3.0 = 3.0 (giving 15g base gold at lvl 70 based on default 5g base config)
+        levelScale = (static_cast<float>(lvl * lvl) / 4900.0f) * 3.0f;
+    }
+    else
+    {
+        // WotLK: scale quadratically up to 16.0x (original formula)
+        // At lvl 80: (80*80)/400 = 16.0 (giving 80g base gold at lvl 80 based on default 5g base config)
+        levelScale = static_cast<float>(lvl * lvl) / 400.0f;
+    }
+
+    return levelScale;
 }
 
 } // namespace DungeonMaster

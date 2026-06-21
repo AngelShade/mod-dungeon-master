@@ -64,6 +64,7 @@ public:
     // Rewards
     void DistributeRewards(Session* session);
     void FillCreatureLoot(Creature* creature, Session* session, bool isBoss);
+    float GetExpansionGoldMultiplier(uint8 effectiveLevel) const;
 
     // Cooldowns
     bool   IsOnCooldown(ObjectGuid playerGuid) const;
