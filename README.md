@@ -66,6 +66,12 @@ Players talk to a Dungeon Master NPC, pick a difficulty, creature theme, and dun
 
 6. **Restart the server.** The Dungeon Master NPC spawns automatically in all major cities.
 
+7. **Install the Client Addon:**
+   Copy the `ACChallengePanel` folder from the root of this module:
+   `modules/mod-dungeon-master/ACChallengePanel`
+   and paste it into your World of Warcraft client directory:
+   `Interface/AddOns/`
+
 ---
 
 ## NPC Spawn Locations
@@ -102,24 +108,28 @@ The Dungeon Master NPC (entry `500000`) spawns in every major city. You can also
 
 ## How It Works
 
-### Standard Mode
+The module integrates with the golden-framed in-game Control Panel (`ACChallengePanel` addon) to replace traditional, clunky text gossip menus with a premium visual UI.
 
-1. Talk to the Dungeon Master NPC
-2. Choose **difficulty tier** (Novice → Grandmaster)
-3. Choose **scaling mode**:
-   - **Scale to Party** — creatures match your group's average level
-   - **Use Dungeon Difficulty** — creatures stay at the tier's natural level range
-4. Choose **creature theme** (Undead, Demons, Beasts, etc.)
-5. Choose **dungeon**
-6. Confirm → teleport in → kill everything → collect rewards → teleport out
+### Accessing the Interface
+* **Open the Panel**: Talk to any **Dungeon Master** NPC in major cities to bring up the golden control interface.
+* **Review Stats & Mastery**: Type `/accp` in chat (or use the custom minimap icon) to open the UI anywhere in the world to manage your Mastery Perks, check the Bestiary, or view Affix Familiarity statistics.
+
+### Standard Mode
+1. Interact with a **Dungeon Master** NPC to open the addon panel.
+2. Select your target **Dungeon** and **Creature Theme** (e.g. Demonic Invasion, Undead Rising) from the visual dropdowns.
+3. Configure your **Difficulty Tier** (Novice → Grandmaster) and **Scaling Mode**:
+   - **Scale to Party**: Enemies match your group's average level.
+   - **Dungeon Default**: Enemies remain at the tier's native level range.
+4. Click **Start Run** → Teleport in → Clear the instance → Claim rewards!
 
 ### Roguelike Mode
-
-1. Talk to the NPC → select **Roguelike Challenge**
-2. Choose difficulty, scaling, and theme (or random theme each floor)
-3. Clear floor 1 → earn +10% all stats buff → auto-transition to floor 2
-4. Enemies get harder each tier; affixes kick in at tier 3+
-5. Keep going until you wipe — highest tier reached, floors cleared, and kills are saved to the roguelike leaderboard (separate from normal runs)
+1. Select the **Roguelike Challenge** tab in the addon panel.
+2. Choose your starting difficulty, scaling, and theme parameters.
+3. **Preparation Phase**: Teleporting in sets up a 30-second grace window. During this prep phase, you can:
+   - Toggle optional **Gambits** (Time Trial, Glass Cannon, Pacifist) from the Active Run UI to increase rewards.
+   - Spend **Veto Tokens** by clicking the red 'X' overlays on active affixes to reroll them.
+4. **Ascension**: Clear the floor, earn a stacking +10% stat buff, and interact with the **Branching Path Cards UI** to select your next dungeon destination and theme.
+5. Progression scales infinitely with Mythic+ style affixes until your party wipes!
 
 ### Level Scaling
 
@@ -128,6 +138,7 @@ Creatures are force-scaled to the session's target level regardless of their ori
 - **Effective Level** = party average (Scale to Party) or tier midpoint (Use Dungeon Difficulty)
 - **Level Band** = EffectiveLevel ± `LevelBand` (default ±3), clamped to the tier's range
 - Stats are recalculated from `creature_classlevelstats` for the target level
+
 
 ---
 
