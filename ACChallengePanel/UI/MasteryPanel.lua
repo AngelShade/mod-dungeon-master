@@ -110,9 +110,11 @@ function ACDM.CreateMasteryPanel()
 
         -- Mouse Highlight
         local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
-        highlight:SetTexture("Interface\\Buttons\\UI-Common-MouseHilight")
-        highlight:SetAllPoints(btn)
+        highlight:SetTexture("Interface\\Buttons\\UI-ListboxHighlight")
+        highlight:SetPoint("TOPLEFT", btn, "TOPLEFT", 3, -3)
+        highlight:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -3, 3)
         highlight:SetBlendMode("ADD")
+
 
         -- Tooltip script
         btn:SetScript("OnEnter", function(self)
