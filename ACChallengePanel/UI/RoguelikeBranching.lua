@@ -62,10 +62,11 @@ function ACDM.ShowBranchingChoices()
 
             -- Highlight texture on hover
             local highlight = card:CreateTexture(nil, "HIGHLIGHT")
-            highlight:SetTexture("Interface\\Buttons\\UI-ListboxHighlight")
+            highlight:SetTexture("Interface\\Buttons\\UI-Listbox-Highlight")
             highlight:SetPoint("TOPLEFT", card, "TOPLEFT", 3, -3)
             highlight:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -3, 3)
             highlight:SetBlendMode("ADD")
+
 
 
             -- Dungeon Title (with word wrap)
